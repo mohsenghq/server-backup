@@ -48,6 +48,14 @@ pub enum Error {
     #[error("unsafe path component in snapshot tree: {0}")]
     BadPath(String),
 
+    /// A stored blob does not match the repository's blob envelope.
+    #[error("malformed blob: {0}")]
+    MalformedBlob(String),
+
+    /// A stored blob's compressed payload could not be decompressed.
+    #[error("decompression failed: {0}")]
+    DecompressFailed(String),
+
     /// Stored JSON (a repo config or snapshot manifest) could not be parsed.
     #[error("malformed {what}: {source}")]
     Malformed {

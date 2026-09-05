@@ -7,6 +7,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::backend::{Backend, LocalBackend};
+use crate::blobs;
 use crate::chunk::{chunk_stream, ChunkerConfig};
 use crate::error::{Error, Result};
 use crate::snapshot::{BlobKind, BlobRef, Snapshot, SnapshotIndex, SnapshotStats};
@@ -166,9 +167,10 @@ impl Repository {
 
         for (hash, bytes) in &node_blobs {
             if !self.backend.exists(&blob_key(hash)).await? {
-                self.backend.put(&blob_key(hash), bytes).await?;
+                let stored = blobs::encode(bytes);
+                self.backend.put(&blob_key(hash), &stored).await?;
                 stats.new_tree_nodes += 1;
-                written.insert(hash.clone(), bytes.len() as u64);
+                written.insert(hash.clone(), stored.len() as u64);
             }
         }
 
@@ -310,10 +312,11 @@ impl Repository {
 
         for (hex, bytes) in pending {
             if !self.backend.exists(&blob_key(&hex)).await? {
-                self.backend.put(&blob_key(&hex), &bytes).await?;
+                let stored = blobs::encode(&bytes);
+                self.backend.put(&blob_key(&hex), &stored).await?;
                 stats.new_chunks += 1;
-                stats.new_bytes += bytes.len() as u64;
-                written.insert(hex, bytes.len() as u64);
+                stats.new_bytes += stored.len() as u64;
+                written.insert(hex, stored.len() as u64);
             }
         }
 
@@ -498,12 +501,14 @@ async fn collect_node_blob_hashes(
                 size: None,
                 kind: BlobKind::TreeNode,
             });
-            let bytes = backend.get(&blob_key(hash)).await?;
+            let stored = backend.get(&blob_key(hash)).await?;
+            let bytes = blobs::decode(&stored)?;
             let inner: Node =
                 serde_json::from_slice(&bytes).map_err(|source| Error::Malformed {
                     what: format!("tree node {hash}"),
                     source,
                 })?;
+
             Box::pin(collect_node_blob_hashes(backend, &inner, out, seen)).await
         }
         Node::Dir { children, .. } => {
@@ -544,7 +549,8 @@ async fn restore_node(backend: &dyn Backend, node: &Node, dir: &Path) -> Result<
             Ok(())
         }
         Node::Ref { hash, .. } => {
-            let bytes = backend.get(&blob_key(hash)).await?;
+            let stored = backend.get(&blob_key(hash)).await?;
+            let bytes = blobs::decode(&stored)?;
             let inner: Node =
                 serde_json::from_slice(&bytes).map_err(|source| Error::Malformed {
                     what: format!("tree node {hash}"),
@@ -573,7 +579,8 @@ async fn restore_file(backend: &dyn Backend, dest: &Path, chunks: &[String]) -> 
         if !backend.exists(&key).await? {
             return Err(Error::MissingBlob(hex.clone()));
         }
-        let bytes = backend.get(&key).await?;
+        let stored = backend.get(&key).await?;
+        let bytes = blobs::decode(&stored)?;
         writer
             .write_all(&bytes)
             .await

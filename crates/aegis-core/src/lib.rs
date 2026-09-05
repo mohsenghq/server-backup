@@ -20,6 +20,7 @@
 #![warn(missing_docs)]
 
 pub mod backend;
+pub mod blobs;
 pub mod chunk;
 pub mod error;
 pub mod repo;
