@@ -1,9 +1,11 @@
-//! End-to-end: a real directory tree survives a backup/restore round trip, and
-//! backing the same tree up twice writes no new blobs.
+//! End-to-end: a real directory tree survives a backup/restore round trip
+//! against the Merkle-tree repository format, dedup holds within runs and
+//! across snapshots (including subtree renames), and the per-snapshot index
+//! matches what the tree actually references.
 
 use std::path::{Path, PathBuf};
 
-use aegis_core::{ChunkerConfig, Repository};
+use aegis_core::{ChunkerConfig, Node, Repository};
 
 /// Small chunk sizes so fixtures stay in the kilobytes rather than megabytes.
 fn chunker() -> ChunkerConfig {
@@ -87,7 +89,7 @@ async fn backup_then_restore_reproduces_the_tree() {
     let target = tmp.path().join("restored");
     build_tree(&source);
 
-    let repo = Repository::init(&repo_path, chunker()).await.unwrap();
+    let repo = Repository::init_local(&repo_path, chunker()).await.unwrap();
     let snapshot = repo.backup(std::slice::from_ref(&source)).await.unwrap();
 
     assert_eq!(snapshot.stats.files, 4);
@@ -99,6 +101,10 @@ async fn backup_then_restore_reproduces_the_tree() {
         snapshot.stats.new_chunks < snapshot.stats.chunks,
         "the duplicated file should dedup within the run"
     );
+    assert!(
+        snapshot.stats.new_tree_nodes > 0,
+        "the tree itself has node blobs"
+    );
 
     // Restoring by a short id prefix must work, as `aegis snapshots` displays one.
     let restored = repo.restore(snapshot.short_id(), &target).await.unwrap();
@@ -108,13 +114,48 @@ async fn backup_then_restore_reproduces_the_tree() {
 }
 
 #[tokio::test]
+async fn empty_file_is_captured_and_restored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let repo_path = tmp.path().join("repo");
+    write(&source.join("zero.bin"), b"");
+
+    let repo = Repository::init_local(&repo_path, chunker()).await.unwrap();
+    let snapshot = repo.backup(std::slice::from_ref(&source)).await.unwrap();
+    repo.restore(&snapshot.id, tmp.path().join("out"))
+        .await
+        .unwrap();
+
+    let restored = tmp.path().join("out/source/zero.bin");
+    assert!(restored.is_file(), "empty file must exist after restore");
+    assert_eq!(std::fs::read(&restored).unwrap(), b"");
+}
+
+#[tokio::test]
+async fn deep_nesting_and_unicode_names_round_trip() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let repo_path = tmp.path().join("repo");
+    write(&source.join("a/b/c/d/e/f/deep.txt"), b"deep");
+    write(&source.join("ünïcodé/φάκελος/日本語.txt"), b"unicode");
+
+    let repo = Repository::init_local(&repo_path, chunker()).await.unwrap();
+    let snapshot = repo.backup(std::slice::from_ref(&source)).await.unwrap();
+    repo.restore(&snapshot.id, tmp.path().join("out"))
+        .await
+        .unwrap();
+
+    assert_eq!(collect(&source), collect(&tmp.path().join("out/source")));
+}
+
+#[tokio::test]
 async fn rebacking_up_an_unchanged_tree_writes_no_new_blobs() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
     let repo_path = tmp.path().join("repo");
     build_tree(&source);
 
-    let repo = Repository::init(&repo_path, chunker()).await.unwrap();
+    let repo = Repository::init_local(&repo_path, chunker()).await.unwrap();
     repo.backup(std::slice::from_ref(&source)).await.unwrap();
     let before = blob_count(&repo_path);
     assert!(before > 0);
@@ -122,7 +163,11 @@ async fn rebacking_up_an_unchanged_tree_writes_no_new_blobs() {
     let second = repo.backup(std::slice::from_ref(&source)).await.unwrap();
     assert_eq!(
         second.stats.new_chunks, 0,
-        "unchanged tree produced new chunks"
+        "unchanged tree produced new data chunks"
+    );
+    assert_eq!(
+        second.stats.new_tree_nodes, 0,
+        "unchanged tree produced new tree nodes"
     );
     assert_eq!(
         blob_count(&repo_path),
@@ -133,13 +178,75 @@ async fn rebacking_up_an_unchanged_tree_writes_no_new_blobs() {
 }
 
 #[tokio::test]
+async fn renaming_a_parent_dir_reuses_every_child_tree_node() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let repo_path = tmp.path().join("repo");
+    build_tree(&source);
+
+    let repo = Repository::init_local(&repo_path, chunker()).await.unwrap();
+    let first = repo.backup(std::slice::from_ref(&source)).await.unwrap();
+
+    // Rename the top directory: every path changes but no content does.
+    let renamed = tmp.path().join("renamed");
+    std::fs::rename(&source, &renamed).unwrap();
+
+    let second = repo.backup(std::slice::from_ref(&renamed)).await.unwrap();
+    assert_eq!(
+        second.stats.new_chunks, 0,
+        "a pure rename must not rewrite data chunks"
+    );
+    // The renamed root's own node differs (its name is inside it), but every
+    // node below it is shared with the first snapshot.
+    let shared_below_root = subtree_dedup(&repo, &first, &second).await;
+    assert!(
+        shared_below_root,
+        "all non-root tree nodes should be reused after a rename"
+    );
+}
+
+/// Check that the second snapshot's tree references the same node blobs below
+/// its top-level path directories as the first one did: renaming `source` to
+/// `renamed` changes the synthetic root, the renamed dir's own node, and
+/// nothing else — every descendant must be shared.
+async fn subtree_dedup(
+    _repo: &Repository,
+    first: &aegis_core::Snapshot,
+    second: &aegis_core::Snapshot,
+) -> bool {
+    // Descendant hashes of a node, excluding the node itself.
+    fn descendant_hashes(node: &Node, out: &mut Vec<String>) {
+        if let Node::Dir { children, .. } = node {
+            for c in children {
+                out.push(c.hash_hex());
+                descendant_hashes(c, out);
+            }
+        }
+    }
+    // Start below the top-level per-path dir (the renamed one).
+    fn below_top(snapshot: &aegis_core::Snapshot) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Node::Dir { children, .. } = &snapshot.root {
+            for top in children {
+                descendant_hashes(top, &mut out);
+            }
+        }
+        out.sort();
+        out
+    }
+    let a = below_top(first);
+    let b = below_top(second);
+    !a.is_empty() && a == b
+}
+
+#[tokio::test]
 async fn appending_to_a_file_reuses_existing_chunks() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("source");
     let repo_path = tmp.path().join("repo");
     write(&source.join("data.bin"), &pseudo_random(300 * 1024, 17));
 
-    let repo = Repository::init(&repo_path, chunker()).await.unwrap();
+    let repo = Repository::init_local(&repo_path, chunker()).await.unwrap();
     let first = repo.backup(std::slice::from_ref(&source)).await.unwrap();
 
     let mut grown = pseudo_random(300 * 1024, 17);
@@ -160,13 +267,15 @@ async fn init_twice_fails_and_open_reads_back_the_config() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_path = tmp.path().join("repo");
 
-    let created = Repository::init(&repo_path, chunker()).await.unwrap();
+    let created = Repository::init_local(&repo_path, chunker()).await.unwrap();
     let id = created.config().id.clone();
 
-    assert!(Repository::init(&repo_path, chunker()).await.is_err());
-    assert!(Repository::open(tmp.path().join("nope")).await.is_err());
+    assert!(Repository::init_local(&repo_path, chunker()).await.is_err());
+    assert!(Repository::open_local(tmp.path().join("nope"))
+        .await
+        .is_err());
 
-    let opened = Repository::open(&repo_path).await.unwrap();
+    let opened = Repository::open_local(&repo_path).await.unwrap();
     assert_eq!(opened.config().id, id);
     assert_eq!(opened.config().chunker, chunker());
     assert!(opened.list_snapshots().await.unwrap().is_empty());
@@ -176,7 +285,7 @@ async fn init_twice_fails_and_open_reads_back_the_config() {
 async fn restoring_an_unknown_snapshot_fails() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_path = tmp.path().join("repo");
-    let repo = Repository::init(&repo_path, chunker()).await.unwrap();
+    let repo = Repository::init_local(&repo_path, chunker()).await.unwrap();
     assert!(repo
         .restore("deadbeef", tmp.path().join("out"))
         .await
@@ -190,7 +299,7 @@ async fn snapshots_list_newest_first_even_within_the_same_second() {
     let repo_path = tmp.path().join("repo");
     write(&source.join("a.txt"), b"a");
 
-    let repo = Repository::init(&repo_path, chunker()).await.unwrap();
+    let repo = Repository::init_local(&repo_path, chunker()).await.unwrap();
     let first = repo.backup(std::slice::from_ref(&source)).await.unwrap();
     let second = repo.backup(std::slice::from_ref(&source)).await.unwrap();
 
@@ -209,4 +318,81 @@ async fn snapshots_list_newest_first_even_within_the_same_second() {
     // display_time drops sub-second digits but keeps a parseable timestamp.
     assert_eq!(first.display_time().len(), 19);
     assert!(second.display_time().starts_with("20"));
+}
+
+#[tokio::test]
+async fn snapshot_index_lists_every_referenced_blob() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let repo_path = tmp.path().join("repo");
+    build_tree(&source);
+
+    let repo = Repository::init_local(&repo_path, chunker()).await.unwrap();
+    let snapshot = repo.backup(std::slice::from_ref(&source)).await.unwrap();
+
+    let index = repo.snapshot_index(&snapshot).await.unwrap();
+    assert_eq!(index.snapshot_id, snapshot.id);
+
+    // Every hash the tree references must be in the index...
+    let mut chunks = Vec::new();
+    snapshot.root.collect_chunk_hashes(&mut chunks);
+    for c in &chunks {
+        assert!(
+            index.blobs.iter().any(|b| &b.hash == c),
+            "chunk {c} missing from index"
+        );
+    }
+    // ...and every indexed chunk must exist as a blob in the repository.
+    for b in &index.blobs {
+        assert!(
+            b.hash.len() == 64 && b.hash.bytes().all(|c| c.is_ascii_hexdigit()),
+            "index contains a malformed hash: {}",
+            b.hash
+        );
+        assert!(
+            repo.backend()
+                .exists(&aegis_core::repo_test_hooks::blob_key_for(&b.hash))
+                .await
+                .unwrap(),
+            "indexed blob {} missing from repository",
+            b.hash
+        );
+    }
+    // Sizes are known for blobs this run wrote.
+    assert!(
+        index.blobs.iter().all(|b| b.size.is_some()),
+        "sizes must be recorded for every indexed blob"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_index_fallback_walks_the_tree_when_index_is_missing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let repo_path = tmp.path().join("repo");
+    write(&source.join("data.bin"), &pseudo_random(64 * 1024, 31));
+
+    let repo = Repository::init_local(&repo_path, chunker()).await.unwrap();
+    let snapshot = repo.backup(std::slice::from_ref(&source)).await.unwrap();
+
+    // Simulate a pre-index manifest: remove the index file behind the backend's
+    // back, then ask for the index again.
+    let index_path = repo_path
+        .join("index")
+        .join(format!("{}.json", snapshot.id));
+    std::fs::remove_file(&index_path).unwrap();
+    assert!(!index_path.exists());
+
+    let derived = repo.snapshot_index(&snapshot).await.unwrap();
+    assert!(!derived.blobs.is_empty(), "fallback walk found nothing");
+    for b in &derived.blobs {
+        assert!(
+            repo.backend()
+                .exists(&aegis_core::repo_test_hooks::blob_key_for(&b.hash))
+                .await
+                .unwrap(),
+            "fallback-derived blob {} does not exist",
+            b.hash
+        );
+    }
 }

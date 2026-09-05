@@ -10,6 +10,7 @@ repository.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
 fastcdc.workspace = true
+filetime.workspace = true
 hostname.workspace = true
 serde.workspace = true
 serde_json.workspace = true

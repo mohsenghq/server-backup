@@ -88,7 +88,7 @@ async fn main() -> Result<()> {
             max_chunk_size,
         } => {
             let chunker = ChunkerConfig::new(min_chunk_size, avg_chunk_size, max_chunk_size)?;
-            let r = Repository::init(&repo, chunker)
+            let r = Repository::init_local(&repo, chunker)
                 .await
                 .with_context(|| format!("initializing repository at {}", repo.display()))?;
             emit(
@@ -108,17 +108,30 @@ async fn main() -> Result<()> {
             let r = open(&repo).await?;
             let snapshot = r.backup(&paths).await.context("running backup")?;
             let s = snapshot.stats;
-            emit(cli.json, &snapshot, || {
-                println!(
-                    "snapshot {}\n  {} files, {} read, {} chunks ({} new, {} written)",
-                    snapshot.short_id(),
-                    s.files,
-                    human_bytes(s.bytes),
-                    s.chunks,
-                    s.new_chunks,
-                    human_bytes(s.new_bytes),
-                );
-            });
+            emit(
+                cli.json,
+                &serde_json::json!({
+                    "id": snapshot.id,
+                    "time": snapshot.time,
+                    "hostname": snapshot.hostname,
+                    "paths": snapshot.paths,
+                    "root_hash": snapshot.root_hash(),
+                    "stats": s,
+                }),
+                || {
+                    println!(
+                        "snapshot {} (tree {})\n  {} files, {} read, {} chunks ({} new, {} written, {} tree nodes)",
+                        snapshot.short_id(),
+                        &snapshot.root_hash()[..16],
+                        s.files,
+                        human_bytes(s.bytes),
+                        s.chunks,
+                        s.new_chunks,
+                        human_bytes(s.new_bytes),
+                        s.new_tree_nodes,
+                    );
+                },
+            );
         }
 
         Command::Snapshots { repo } => {
@@ -175,7 +188,7 @@ async fn main() -> Result<()> {
 }
 
 async fn open(repo: &PathBuf) -> Result<Repository> {
-    Repository::open(repo)
+    Repository::open_local(repo)
         .await
         .with_context(|| format!("opening repository at {}", repo.display()))
 }

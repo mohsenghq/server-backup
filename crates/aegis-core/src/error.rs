@@ -17,11 +17,11 @@ pub enum Error {
 
     /// A repository already exists at the target location.
     #[error("a repository already exists at {0}")]
-    RepoExists(PathBuf),
+    RepoExists(String),
 
     /// No repository was found at the given location.
     #[error("no repository at {0} (run `aegis init` first)")]
-    RepoNotFound(PathBuf),
+    RepoNotFound(String),
 
     /// The repository was written by an incompatible format version.
     #[error("unsupported repository format version {found} (this build supports {supported})")]
@@ -39,6 +39,14 @@ pub enum Error {
     /// A blob referenced by a snapshot is missing from the repository.
     #[error("blob {0} referenced by snapshot is missing from the repository")]
     MissingBlob(String),
+
+    /// A name in a snapshot tree is not a safe single path component.
+    ///
+    /// Manifests are attacker-influenced input on a shared repository; a name
+    /// that could escape the restore target (`..`, absolute-ish, separator
+    /// characters) must never reach the filesystem.
+    #[error("unsafe path component in snapshot tree: {0}")]
+    BadPath(String),
 
     /// Stored JSON (a repo config or snapshot manifest) could not be parsed.
     #[error("malformed {what}: {source}")]

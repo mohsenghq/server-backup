@@ -7,9 +7,10 @@
 //!
 //! ```no_run
 //! # async fn example() -> aegis_core::Result<()> {
-//! use aegis_core::{ChunkerConfig, Repository};
+//! use aegis_core::{ChunkerConfig, LocalBackend, Repository};
 //!
-//! let repo = Repository::init("/srv/backups", ChunkerConfig::default()).await?;
+//! let backend = Box::new(LocalBackend::new("/srv/backups"));
+//! let repo = Repository::init(backend, ChunkerConfig::default()).await?;
 //! let snapshot = repo.backup(&["/etc".into()]).await?;
 //! repo.restore(&snapshot.id, "/tmp/restored").await?;
 //! # Ok(())
@@ -23,9 +24,20 @@ pub mod chunk;
 pub mod error;
 pub mod repo;
 pub mod snapshot;
+pub mod tree;
 
 pub use backend::{Backend, LocalBackend};
 pub use chunk::{Chunk, ChunkHash, ChunkerConfig};
 pub use error::{Error, Result};
 pub use repo::{RepoConfig, Repository, FORMAT_VERSION};
-pub use snapshot::{FileEntry, Snapshot, SnapshotStats};
+pub use snapshot::{BlobKind, BlobRef, Snapshot, SnapshotIndex, SnapshotStats};
+pub use tree::{Node, INLINE_LIMIT};
+
+/// Stable key-layout helpers exposed for integration tests and inspection
+/// tooling; not part of the core API surface.
+pub mod repo_test_hooks {
+    /// The `blobs/<xx>/<hash>` repository key for a hex blob hash.
+    pub fn blob_key_for(hex: &str) -> String {
+        crate::repo::blob_key(hex)
+    }
+}

@@ -56,6 +56,13 @@ pub trait Backend: Send + Sync {
     ///
     /// Returns [`Error::Io`] if the object exists but cannot be removed.
     async fn delete(&self, key: &str) -> Result<()>;
+
+    /// A short, human-readable description of where this backend stores data
+    /// (used in error messages, e.g. `"/srv/backups"` or
+    /// `"sftp://user@host/srv"`).
+    fn describe(&self) -> String {
+        "<backend>".to_string()
+    }
 }
 
 /// A [`Backend`] backed by a directory on the local filesystem.
@@ -79,6 +86,12 @@ impl LocalBackend {
         // Keys are generated internally and always `/`-separated; splitting keeps
         // the layout identical on Windows.
         key.split('/').fold(self.root.clone(), |p, seg| p.join(seg))
+    }
+}
+
+impl std::fmt::Display for LocalBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.root.display())
     }
 }
 
@@ -159,6 +172,10 @@ impl Backend for LocalBackend {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(Error::io(path, e)),
         }
+    }
+
+    fn describe(&self) -> String {
+        self.root.display().to_string()
     }
 }
 
