@@ -1,0 +1,10 @@
+[package]
+name = "aegis-server"
+description = "Aegis control plane: host inventory, scheduler, job queue, REST API. Not yet implemented (Phase 3)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]

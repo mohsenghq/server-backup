@@ -1,0 +1,10 @@
+[package]
+name = "aegis-mcp"
+description = "Aegis MCP server, exposing the Aegis API as MCP tools. Not yet implemented (Phase 6)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]

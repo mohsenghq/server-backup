@@ -6,3 +6,15 @@ This folder is a ready-to-use project scaffold for Claude Code. Unzip it into a 
 - `PROGRESS.md` — living state: current phase, what's done, next action
 - `ROADMAP.md` — the full phase-by-phase checklist
 - `docs/` — detailed specs, one topic per file
+
+## Using the CLI (Phase 0)
+
+```sh
+cargo run -p aegis-cli -- init     --repo /srv/backups
+cargo run -p aegis-cli -- backup /etc --repo /srv/backups
+cargo run -p aegis-cli -- snapshots  --repo /srv/backups
+cargo run -p aegis-cli -- restore --repo /srv/backups --snapshot <id> --target /tmp/restored
+```
+
+Add `--json` to any command for machine-readable output. Snapshots are **not yet
+encrypted or compressed** — that lands in Phase 1.

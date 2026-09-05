@@ -4,12 +4,12 @@ Static plan — what "done" means for each phase. Work top to bottom, in order. 
 
 ## Phase 0 — Foundations
 
-- [ ] Initialize Rust workspace: `crates/aegis-core`, `aegis-cli`, `aegis-server`, `aegis-agent`, `aegis-mcp`
-- [ ] GitHub Actions CI: build + test on Linux/Windows/macOS, `clippy`, `fmt --check`
-- [ ] `aegis-core`: content-defined chunking (FastCDC) + hashing (BLAKE3)
-- [ ] `aegis-core`: local filesystem backend
-- [ ] `aegis-cli`: `aegis backup <path>` and `aegis restore` working end-to-end against a local repo
-- [ ] Unit tests for the chunker
+- [x] Initialize Rust workspace: `crates/aegis-core`, `aegis-cli`, `aegis-server`, `aegis-agent`, `aegis-mcp`
+- [x] GitHub Actions CI: build + test on Linux/Windows/macOS, `clippy`, `fmt --check`
+- [x] `aegis-core`: content-defined chunking (FastCDC) + hashing (BLAKE3)
+- [x] `aegis-core`: local filesystem backend
+- [x] `aegis-cli`: `aegis backup <path>` and `aegis restore` working end-to-end against a local repo
+- [x] Unit tests for the chunker
 
 ## Phase 1 — Core Engine Complete
 
