@@ -23,9 +23,10 @@ pub struct Flags(pub u8);
 impl Flags {
     /// Payload is stored exactly as produced (no transform). Bit 0.
     pub const PLAIN: u8 = 0b0000_0001;
-    /// Payload is zstd-compressed. Bit 1. (Encryption will add its own bit
-    /// and compose with these.)
+    /// Payload is zstd-compressed. Bit 1. Composes with [`Flags::ENC`].
     pub const ZSTD: u8 = 0b0000_0010;
+    /// Payload is encrypted (nonce‖ciphertext‖tag). Bit 2.
+    pub const ENC: u8 = 0b0000_0100;
 
     /// Flags for a payload that was compressed.
     pub const fn compressed() -> Self {
@@ -37,14 +38,17 @@ impl Flags {
         Self(Self::PLAIN)
     }
 
-    /// Exactly one storage bit must be set.
+    /// Exactly one storage bit (PLAIN or ZSTD) must be set; ENC may compose
+    /// with either.
     fn valid(self) -> bool {
         let f = self.0;
-        f == Self::PLAIN || f == Self::ZSTD
+        let storage = f & !Self::ENC;
+        storage == Self::PLAIN || storage == Self::ZSTD
     }
 
-    fn is_zstd(self) -> bool {
-        self.0 & Self::ZSTD != 0
+    #[allow(dead_code)]
+    fn is_enc(self) -> bool {
+        self.0 & Self::ENC != 0
     }
 }
 
@@ -119,18 +123,21 @@ pub fn choose_level(payload: &[u8]) -> i32 {
     9
 }
 
-/// Compress and wrap a payload for storage.
+/// Compress (if it helps) and wrap a plaintext payload for storage.
 pub fn encode(payload: &[u8]) -> Vec<u8> {
+    let (flags, payload) = compress_payload(payload);
+    wrap(flags, &payload)
+}
+
+/// Compress-if-helpful shared by the plain and encrypted encode paths.
+fn compress_payload(payload: &[u8]) -> (Flags, Vec<u8>) {
     let level = choose_level(payload);
     if level <= 1 {
-        // Not worth trying: store plain.
-        return wrap(Flags::plain(), payload);
+        return (Flags::plain(), payload.to_vec());
     }
-    let compressed = zstd::stream::encode_all(payload, level);
-    match compressed {
-        Ok(c) if c.len() < payload.len() => wrap(Flags::compressed(), &c),
-        // Compression did not help (or failed): plain is always valid.
-        _ => wrap(Flags::plain(), payload),
+    match zstd::stream::encode_all(payload, level) {
+        Ok(c) if c.len() < payload.len() => (Flags::compressed(), c),
+        _ => (Flags::plain(), payload.to_vec()),
     }
 }
 
@@ -142,11 +149,54 @@ pub fn encode(payload: &[u8]) -> Vec<u8> {
 /// [`Error::DecompressFailed`] if the zstd stream is corrupt.
 pub fn decode(blob: &[u8]) -> Result<Vec<u8>> {
     let (flags, payload) = unwrap(blob)?;
-    if flags.is_zstd() {
+    decompress_payload(flags, payload)
+}
+
+fn decompress_payload(flags: Flags, payload: &[u8]) -> Result<Vec<u8>> {
+    if flags.0 & Flags::ZSTD != 0 {
         zstd::stream::decode_all(payload).map_err(|e| Error::DecompressFailed(e.to_string()))
     } else {
         Ok(payload.to_vec())
     }
+}
+
+/// Encrypt-then-wrap: compress first (compression on ciphertext is
+/// useless), then seal under `crypto` for `context`, then envelope.
+///
+/// # Errors
+///
+/// Returns whatever [`crate::keys::RepoCrypto::seal`] returns.
+pub fn encrypt_and_encode(
+    crypto: &crate::keys::RepoCrypto,
+    context: &crate::keys::AeadContext,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
+    let (cflags, compressed) = compress_payload(payload);
+    let sealed = crypto.seal(context, &compressed)?;
+    let flags = cflags.0 | Flags::ENC;
+    Ok(wrap(Flags(flags), &sealed))
+}
+
+/// Undo [`encrypt_and_encode`]: envelope → authenticate+decrypt → decompress.
+///
+/// # Errors
+///
+/// Returns [`Error::MalformedBlob`] for envelope problems,
+/// [`Error::DecryptFailed`] for wrong-key or tampered data, and
+/// [`Error::DecompressFailed`] for a corrupt zstd stream.
+pub fn decrypt_and_decode(
+    crypto: &crate::keys::RepoCrypto,
+    context: &crate::keys::AeadContext,
+    blob: &[u8],
+) -> Result<Vec<u8>> {
+    let (flags, payload) = unwrap(blob)?;
+    if flags.0 & Flags::ENC == 0 {
+        return Err(Error::MalformedBlob(
+            "blob is not encrypted but this repository requires encryption".into(),
+        ));
+    }
+    let plaintext = crypto.open(context, payload)?;
+    decompress_payload(Flags(flags.0 & !Flags::ENC), &plaintext)
 }
 
 #[cfg(test)]
@@ -216,5 +266,47 @@ mod tests {
     #[test]
     fn magic_is_version_tagged() {
         assert_eq!(&MAGIC, b"AE1\x01");
+    }
+
+    #[test]
+    fn encrypt_round_trip_and_tamper_rejection() {
+        use crate::keys::{AeadContext, PassphraseSource, RepoCrypto};
+        // A deterministic-passphrase crypto instance via the real unwrap path.
+        let master = crate::crypto::generate_master_key();
+        let (crypto, _) = RepoCrypto::new_wrapped(
+            "t",
+            &master,
+            "p",
+            &crate::crypto::KdfParams {
+                memory_kib: 8 * 1024,
+                iterations: 1,
+                parallelism: 1,
+            },
+        )
+        .unwrap();
+        let ctx = AeadContext::Hash(&"ab".repeat(32));
+
+        let payload = b"secret backup data ".repeat(50);
+        let blob = encrypt_and_encode(&crypto, &ctx, &payload).unwrap();
+        let (flags, _) = unwrap(&blob).unwrap();
+        assert!(flags.0 & Flags::ENC != 0, "encrypted blobs must set ENC");
+        assert_eq!(decrypt_and_decode(&crypto, &ctx, &blob).unwrap(), payload);
+
+        // Tampering anywhere in the ciphertext breaks authentication.
+        let mut bad = blob.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 1;
+        assert!(decrypt_and_decode(&crypto, &ctx, &bad).is_err());
+
+        // A different address context must fail too.
+        let other = AeadContext::Hash(&"cd".repeat(32));
+        assert!(decrypt_and_decode(&crypto, &other, &blob).is_err());
+
+        // Plain-encoded blobs are rejected in encrypted repos.
+        let plain = encode(&payload);
+        assert!(decrypt_and_decode(&crypto, &ctx, &plain).is_err());
+
+        // Silence unused-import warnings from the test-only import.
+        let _ = PassphraseSource::Env;
     }
 }

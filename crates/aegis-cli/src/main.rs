@@ -3,10 +3,14 @@
 //! The CLI is the product: every capability the server, web UI, desktop apps,
 //! and MCP server expose must exist here first, and the CLI must stay fully
 //! usable with nothing else running (`docs/01-architecture.md`).
+//!
+//! Passphrases are never accepted on argv: use `AEGIS_PASSPHRASE` (or type
+//! one when prompted). On `init` the passphrase is confirmed interactively
+//! when no environment variable is set.
 
 use std::path::PathBuf;
 
-use aegis_core::{ChunkerConfig, Repository};
+use aegis_core::{ChunkerConfig, PassphraseSource, Repository};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
@@ -24,7 +28,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create a new, empty repository.
+    /// Create a new, empty (encrypted) repository.
     Init {
         /// Directory to create the repository in.
         #[arg(long, value_name = "PATH")]
@@ -41,6 +45,15 @@ enum Command {
         /// Maximum chunk size in bytes. Fixed for the life of the repository.
         #[arg(long, value_name = "BYTES", default_value_t = aegis_core::chunk::DEFAULT_MAX_SIZE)]
         max_chunk_size: usize,
+    },
+
+    /// Add another passphrase that can open this repository. Data is not
+    /// re-encrypted: the existing master key is wrapped under the new
+    /// passphrase into a new key slot.
+    KeyAdd {
+        /// Repository to add the key to.
+        #[arg(long, value_name = "PATH")]
+        repo: PathBuf,
     },
 
     /// Back up one or more paths into a repository as a new snapshot.
@@ -88,7 +101,9 @@ async fn main() -> Result<()> {
             max_chunk_size,
         } => {
             let chunker = ChunkerConfig::new(min_chunk_size, avg_chunk_size, max_chunk_size)?;
-            let r = Repository::init_local(&repo, chunker)
+            let pass = load_passphrase(PassphraseSource::Prompt { confirm: true })
+                .context("loading a passphrase for the new repository")?;
+            let r = Repository::init_local(&repo, chunker, &pass)
                 .await
                 .with_context(|| format!("initializing repository at {}", repo.display()))?;
             emit(
@@ -96,11 +111,26 @@ async fn main() -> Result<()> {
                 &serde_json::json!({ "repository": repo, "id": r.config().id }),
                 || {
                     println!(
-                        "initialized repository {} at {}",
+                        "initialized encrypted repository {} at {}",
                         r.config().id,
                         repo.display()
                     )
                 },
+            );
+        }
+
+        Command::KeyAdd { repo } => {
+            let existing = load_passphrase(PassphraseSource::default())
+                .context("loading the repository's current passphrase")?;
+            let new_pass =
+                aegis_core::keys::load_new_passphrase().context("loading the new passphrase")?;
+            let r = aegis_core::keys::key_add(&repo, &existing, &new_pass)
+                .await
+                .with_context(|| format!("adding a key to {}", repo.display()))?;
+            emit(
+                cli.json,
+                &serde_json::json!({ "repository": repo, "key_slot": r }),
+                || println!("added key slot '{r}' — both passphrases now open this repository"),
             );
         }
 
@@ -187,8 +217,14 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Passphrase policy for commands operating on an existing repository.
+fn load_passphrase(source: PassphraseSource) -> Result<String> {
+    aegis_core::keys::load_passphrase(&source).map_err(Into::into)
+}
+
 async fn open(repo: &PathBuf) -> Result<Repository> {
-    Repository::open_local(repo)
+    let pass = load_passphrase(PassphraseSource::default())?;
+    Repository::open_local(repo, &pass)
         .await
         .with_context(|| format!("opening repository at {}", repo.display()))
 }

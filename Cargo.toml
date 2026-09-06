@@ -18,12 +18,19 @@ repository = "https://github.com/mohsenghq/aegis"
 aegis-core = { path = "crates/aegis-core" }
 
 anyhow = "1"
+argon2 = { version = "0.5", features = ["std"] }
 async-trait = "0.1"
+atty = "0.2"
+base64 = "0.22"
 blake3 = "1"
+chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive"] }
 fastcdc = "5"
 filetime = "0.2"
 hostname = "0.4"
+rand_core = { version = "0.6", features = ["getrandom"] }
+zeroize = "1"
+rpassword = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"

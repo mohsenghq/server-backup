@@ -9,7 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::backend::{Backend, LocalBackend};
 use crate::blobs;
 use crate::chunk::{chunk_stream, ChunkerConfig};
+use crate::crypto::KdfParams;
 use crate::error::{Error, Result};
+use crate::keys::{AeadContext, KeyFile, RepoCrypto};
 use crate::snapshot::{BlobKind, BlobRef, Snapshot, SnapshotIndex, SnapshotStats};
 use crate::tree::{self, Node};
 
@@ -20,12 +22,15 @@ const CONFIG_KEY: &str = "config";
 const BLOBS_PREFIX: &str = "blobs";
 const SNAPSHOTS_PREFIX: &str = "snapshots";
 const INDEX_PREFIX: &str = "index";
+const KEYS_PREFIX: &str = "keys";
 
 /// The repository's `config` document.
 ///
-// ponytail: plaintext in Phase 0. `docs/10-security-model.md` requires this to
-// be encrypted under the repo master key; that lands with the Phase 1
-// encryption checklist item, alongside `keys/`.
+/// Deliberately stored in plaintext: it holds no secrets — only the format
+/// version, repo id, chunker parameters, and which key slot opens the repo.
+/// Reading it is what tells Aegis *how* to decrypt everything else. All
+/// sensitive content (data chunks, tree nodes, snapshot manifests, snapshot
+/// indexes) is sealed under the master key before it reaches the backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoConfig {
     /// Repository format version — see [`FORMAT_VERSION`].
@@ -35,6 +40,13 @@ pub struct RepoConfig {
     /// Chunker parameters, fixed at `init` time. Changing them would defeat
     /// deduplication against existing snapshots.
     pub chunker: ChunkerConfig,
+    /// Whether blobs and documents are encrypted (always true for repos this
+    /// build creates).
+    #[serde(default)]
+    pub encrypted: bool,
+    /// Which key slot in `keys/` opens this repository.
+    #[serde(default)]
+    pub key_slot: String,
 }
 
 /// An open Aegis repository.
@@ -45,39 +57,82 @@ pub struct RepoConfig {
 pub struct Repository {
     backend: Box<dyn Backend>,
     config: RepoConfig,
+    crypto: Option<RepoCrypto>,
 }
 
 impl Repository {
-    /// Create a repository in an empty or non-existent location.
+    /// Create an encrypted repository in an empty or non-existent location.
+    ///
+    /// A random master key is generated and wrapped under `passphrase`
+    /// (Argon2id → XChaCha20-Poly1305, see `docs/10-security-model.md`) into
+    /// the `default` key slot. From this point on, **every** byte the
+    /// repository stores — data chunks, tree nodes, snapshot manifests,
+    /// snapshot indexes — is ciphertext; only `config` and the wrapped key
+    /// file are plaintext, and neither contains secrets.
     ///
     /// # Errors
     ///
     /// Returns [`Error::RepoExists`] if a `config` is already present,
     /// [`Error::InvalidChunkerConfig`] for bad chunker parameters, or
     /// [`Error::Io`] if the backend cannot be written.
-    pub async fn init(backend: Box<dyn Backend>, chunker: ChunkerConfig) -> Result<Self> {
+    pub async fn init(
+        backend: Box<dyn Backend>,
+        chunker: ChunkerConfig,
+        passphrase: &str,
+    ) -> Result<Self> {
+        Self::init_with_kdf(backend, chunker, passphrase, KdfParams::default()).await
+    }
+
+    /// [`Repository::init`] with explicit Argon2id parameters. The parameters
+    /// are recorded in the key file, so `open` never has to guess them;
+    /// tests use this to keep derivations fast.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Repository::init`], plus [`Error::KdfFailed`] for bad params.
+    pub async fn init_with_kdf(
+        backend: Box<dyn Backend>,
+        chunker: ChunkerConfig,
+        passphrase: &str,
+        kdf: KdfParams,
+    ) -> Result<Self> {
         chunker.validate()?;
         if backend.exists(CONFIG_KEY).await? {
             return Err(Error::RepoExists(backend.describe()));
         }
+        let master = crate::crypto::generate_master_key();
+        let (crypto, key_file) = RepoCrypto::new_wrapped("default", &master, passphrase, &kdf)?;
+        let key_bytes = key_file.to_json()?;
+        backend
+            .put(&format!("{KEYS_PREFIX}/default.json"), &key_bytes)
+            .await?;
         let config = RepoConfig {
             version: FORMAT_VERSION,
             id: uuid::Uuid::new_v4().to_string(),
             chunker,
+            encrypted: true,
+            key_slot: "default".into(),
         };
         let bytes = serde_json::to_vec_pretty(&config).expect("RepoConfig is serializable");
         backend.put(CONFIG_KEY, &bytes).await?;
-        Ok(Self { backend, config })
+        Ok(Self {
+            backend,
+            config,
+            crypto: Some(crypto),
+        })
     }
 
-    /// Open an existing repository.
+    /// Open an existing repository, unwrapping its master key with
+    /// `passphrase`.
     ///
     /// # Errors
     ///
     /// Returns [`Error::RepoNotFound`] if there is no `config`,
     /// [`Error::UnsupportedFormat`] if it was written by an incompatible
-    /// version, or [`Error::Malformed`] if it cannot be parsed.
-    pub async fn open(backend: Box<dyn Backend>) -> Result<Self> {
+    /// version, [`Error::Malformed`] if it cannot be parsed,
+    /// [`Error::KeyError`] if the configured key slot is missing, and
+    /// [`Error::WrongPassphrase`] if the passphrase does not open it.
+    pub async fn open(backend: Box<dyn Backend>, passphrase: &str) -> Result<Self> {
         if !backend.exists(CONFIG_KEY).await? {
             return Err(Error::RepoNotFound(backend.describe()));
         }
@@ -93,7 +148,69 @@ impl Repository {
                 supported: FORMAT_VERSION,
             });
         }
-        Ok(Self { backend, config })
+        let crypto = if config.encrypted {
+            Some(Self::open_crypto(backend.as_ref(), &config, passphrase).await?)
+        } else {
+            // A pre-encryption repository: readable, but new writes stay
+            // plaintext until it is migrated (Phase 6 re-key flow).
+            None
+        };
+        Ok(Self {
+            backend,
+            config,
+            crypto,
+        })
+    }
+
+    async fn load_key_file(backend: &dyn Backend, slot: &str) -> Result<KeyFile> {
+        let key = format!("{KEYS_PREFIX}/{slot}.json");
+        if !backend.exists(&key).await? {
+            return Err(Error::KeyError(format!(
+                "key slot '{slot}' is missing from the repository"
+            )));
+        }
+        KeyFile::from_json(&backend.get(&key).await?)
+    }
+
+    /// Unlock the repository with `passphrase`, trying the configured slot
+    /// first and then every other key slot. Passphrases added with `key add`
+    /// live in additional slots (`key1`, `key2`, ...), so a repository is
+    /// openable by any of its passphrases, not just the one `config`
+    /// currently names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::KeyError`] if no key file parses, and
+    /// [`Error::WrongPassphrase`] when the passphrase opens none of them.
+    async fn open_crypto(
+        backend: &dyn Backend,
+        config: &RepoConfig,
+        passphrase: &str,
+    ) -> Result<RepoCrypto> {
+        let mut slots = vec![config.key_slot.clone()];
+        for key in backend.list(KEYS_PREFIX).await? {
+            if let Some(stem) = key
+                .strip_prefix("keys/")
+                .and_then(|rest| rest.strip_suffix(".json"))
+            {
+                if !slots.contains(&stem.to_string()) {
+                    slots.push(stem.to_string());
+                }
+            }
+        }
+        let mut last = Error::KeyError("repository has no key files".into());
+        for slot in slots {
+            let Ok(file) = Self::load_key_file(backend, &slot).await else {
+                continue;
+            };
+            match RepoCrypto::from_key_file(&file, passphrase) {
+                Ok(crypto) => return Ok(crypto),
+                // The passphrase may open another slot; remember the failure
+                // in case it opens none.
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
     }
 
     /// Create a repository on the local filesystem — convenience wrapper for
@@ -102,8 +219,38 @@ impl Repository {
     /// # Errors
     ///
     /// Same as [`Repository::init`].
-    pub async fn init_local(path: impl AsRef<Path>, chunker: ChunkerConfig) -> Result<Self> {
-        Self::init(Box::new(LocalBackend::new(path.as_ref())), chunker).await
+    pub async fn init_local(
+        path: impl AsRef<Path>,
+        chunker: ChunkerConfig,
+        passphrase: &str,
+    ) -> Result<Self> {
+        Self::init(
+            Box::new(LocalBackend::new(path.as_ref())),
+            chunker,
+            passphrase,
+        )
+        .await
+    }
+
+    /// [`Repository::init_local`] with explicit Argon2id parameters (tests
+    /// use this to keep derivations fast).
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Repository::init_with_kdf`].
+    pub async fn init_local_with_kdf(
+        path: impl AsRef<Path>,
+        chunker: ChunkerConfig,
+        passphrase: &str,
+        kdf: KdfParams,
+    ) -> Result<Self> {
+        Self::init_with_kdf(
+            Box::new(LocalBackend::new(path.as_ref())),
+            chunker,
+            passphrase,
+            kdf,
+        )
+        .await
     }
 
     /// Open a repository on the local filesystem — convenience wrapper for
@@ -112,13 +259,37 @@ impl Repository {
     /// # Errors
     ///
     /// Same as [`Repository::open`].
-    pub async fn open_local(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open(Box::new(LocalBackend::new(path.as_ref()))).await
+    pub async fn open_local(path: impl AsRef<Path>, passphrase: &str) -> Result<Self> {
+        Self::open(Box::new(LocalBackend::new(path.as_ref())), passphrase).await
     }
 
     /// This repository's configuration.
     pub fn config(&self) -> &RepoConfig {
         &self.config
+    }
+
+    /// Seal `data` for storage: envelope + compression + (when the repo is
+    /// encrypted) AEAD under the repo master key. `key` is the storage key
+    /// the sealed bytes will live at, included in error context only.
+    fn seal_for(&self, key: &str, context: &AeadContext, data: &[u8]) -> Result<Vec<u8>> {
+        match &self.crypto {
+            Some(c) => blobs::encrypt_and_encode(c, context, data),
+            None => {
+                let _ = key;
+                Ok(blobs::encode(data))
+            }
+        }
+    }
+
+    /// Inverse of [`Repository::seal_for`].
+    fn open_for(&self, key: &str, context: &AeadContext, stored: &[u8]) -> Result<Vec<u8>> {
+        match &self.crypto {
+            Some(c) => blobs::decrypt_and_decode(c, context, stored),
+            None => {
+                let _ = key;
+                blobs::decode(stored)
+            }
+        }
     }
 
     /// The backend this repository operates on.
@@ -167,7 +338,7 @@ impl Repository {
 
         for (hash, bytes) in &node_blobs {
             if !self.backend.exists(&blob_key(hash)).await? {
-                let stored = blobs::encode(bytes);
+                let stored = self.seal_for(&blob_key(hash), &AeadContext::Hash(hash), bytes)?;
                 self.backend.put(&blob_key(hash), &stored).await?;
                 stats.new_tree_nodes += 1;
                 written.insert(hash.clone(), stored.len() as u64);
@@ -193,14 +364,22 @@ impl Repository {
         // written before the manifest: once `snapshots/<id>.json` exists,
         // `index/<id>.json` does too.
         let index = self.build_index(&snapshot, &written);
-        let index_bytes = serde_json::to_vec(&index).expect("SnapshotIndex is serializable");
+        let index_plain = serde_json::to_vec(&index).expect("SnapshotIndex is serializable");
+        let index_bytes =
+            self.seal_for(&index_key(&snapshot.id), &AeadContext::Doc, &index_plain)?;
         self.backend
             .put(&index_key(&snapshot.id), &index_bytes)
             .await?;
 
-        let bytes = serde_json::to_vec_pretty(&snapshot).expect("Snapshot is serializable");
+        let manifest_plain =
+            serde_json::to_vec_pretty(&snapshot).expect("Snapshot is serializable");
+        let manifest_bytes = self.seal_for(
+            &snapshot_key(&snapshot.id),
+            &AeadContext::Doc,
+            &manifest_plain,
+        )?;
         self.backend
-            .put(&snapshot_key(&snapshot.id), &bytes)
+            .put(&snapshot_key(&snapshot.id), &manifest_bytes)
             .await?;
         Ok(snapshot)
     }
@@ -312,7 +491,7 @@ impl Repository {
 
         for (hex, bytes) in pending {
             if !self.backend.exists(&blob_key(&hex)).await? {
-                let stored = blobs::encode(&bytes);
+                let stored = self.seal_for(&blob_key(&hex), &AeadContext::Hash(&hex), &bytes)?;
                 self.backend.put(&blob_key(&hex), &stored).await?;
                 stats.new_chunks += 1;
                 stats.new_bytes += stored.len() as u64;
@@ -341,7 +520,8 @@ impl Repository {
             if !key.ends_with(".json") {
                 continue;
             }
-            let raw = self.backend.get(&key).await?;
+            let stored = self.backend.get(&key).await?;
+            let raw = self.open_for(&key, &AeadContext::Doc, &stored)?;
             out.push(
                 serde_json::from_slice(&raw).map_err(|source| Error::Malformed {
                     what: format!("snapshot manifest {key}"),
@@ -383,7 +563,8 @@ impl Repository {
     pub async fn snapshot_index(&self, snapshot: &Snapshot) -> Result<SnapshotIndex> {
         let key = index_key(&snapshot.id);
         if self.backend.exists(&key).await? {
-            let raw = self.backend.get(&key).await?;
+            let stored = self.backend.get(&key).await?;
+            let raw = self.open_for(&key, &AeadContext::Doc, &stored)?;
             return serde_json::from_slice(&raw).map_err(|source| Error::Malformed {
                 what: format!("snapshot index {key}"),
                 source,
@@ -403,8 +584,14 @@ impl Repository {
                 });
             }
         }
-        collect_node_blob_hashes(self.backend.as_ref(), &snapshot.root, &mut blobs, &mut seen)
-            .await?;
+        collect_node_blob_hashes(
+            self.backend.as_ref(),
+            self.crypto.as_ref(),
+            &snapshot.root,
+            &mut blobs,
+            &mut seen,
+        )
+        .await?;
         Ok(SnapshotIndex {
             snapshot_id: snapshot.id.clone(),
             blobs,
@@ -435,10 +622,13 @@ impl Repository {
         match &snapshot.root {
             Node::Dir { children, .. } => {
                 for child in children {
-                    restore_node(self.backend.as_ref(), child, target).await?;
+                    restore_node(self.backend.as_ref(), self.crypto.as_ref(), child, target)
+                        .await?;
                 }
             }
-            other => restore_node(self.backend.as_ref(), other, target).await?,
+            other => {
+                restore_node(self.backend.as_ref(), self.crypto.as_ref(), other, target).await?
+            }
         }
         Ok(snapshot)
     }
@@ -487,6 +677,7 @@ impl Repository {
 /// tree-node blob hash, fetching ref blobs to descend through them.
 async fn collect_node_blob_hashes(
     backend: &dyn Backend,
+    crypto: Option<&RepoCrypto>,
     node: &Node,
     out: &mut Vec<BlobRef>,
     seen: &mut HashSet<String>,
@@ -502,18 +693,18 @@ async fn collect_node_blob_hashes(
                 kind: BlobKind::TreeNode,
             });
             let stored = backend.get(&blob_key(hash)).await?;
-            let bytes = blobs::decode(&stored)?;
+            let bytes = decode_blob_hash_ctx(crypto, hash, &stored)?;
             let inner: Node =
                 serde_json::from_slice(&bytes).map_err(|source| Error::Malformed {
                     what: format!("tree node {hash}"),
                     source,
                 })?;
 
-            Box::pin(collect_node_blob_hashes(backend, &inner, out, seen)).await
+            Box::pin(collect_node_blob_hashes(backend, crypto, &inner, out, seen)).await
         }
         Node::Dir { children, .. } => {
             for child in children {
-                Box::pin(collect_node_blob_hashes(backend, child, out, seen)).await?;
+                Box::pin(collect_node_blob_hashes(backend, crypto, child, out, seen)).await?;
             }
             Ok(())
         }
@@ -521,8 +712,22 @@ async fn collect_node_blob_hashes(
     }
 }
 
+/// Like [`decode_blob`] but authenticating a content-addressed blob against
+/// its own hash.
+fn decode_blob_hash_ctx(crypto: Option<&RepoCrypto>, hex: &str, stored: &[u8]) -> Result<Vec<u8>> {
+    match crypto {
+        Some(c) => blobs::decrypt_and_decode(c, &AeadContext::Hash(hex), stored),
+        None => blobs::decode(stored),
+    }
+}
+
 /// Restore one tree node under `dir`.
-async fn restore_node(backend: &dyn Backend, node: &Node, dir: &Path) -> Result<()> {
+async fn restore_node(
+    backend: &dyn Backend,
+    crypto: Option<&RepoCrypto>,
+    node: &Node,
+    dir: &Path,
+) -> Result<()> {
     node.validate()?;
     match node {
         Node::File {
@@ -533,7 +738,7 @@ async fn restore_node(backend: &dyn Backend, node: &Node, dir: &Path) -> Result<
             ..
         } => {
             let dest = safe_join(dir, name)?;
-            restore_file(backend, &dest, chunks).await?;
+            restore_file(backend, crypto, &dest, chunks).await?;
             restore_mode(&dest, *mode).await?;
             restore_mtime(&dest, *mtime).await;
             Ok(())
@@ -544,25 +749,33 @@ async fn restore_node(backend: &dyn Backend, node: &Node, dir: &Path) -> Result<
                 .await
                 .map_err(|e| Error::io(&here, e))?;
             for child in children {
-                Box::pin(restore_node(backend, child, &here)).await?;
+                Box::pin(restore_node(backend, crypto, child, &here)).await?;
             }
             Ok(())
         }
         Node::Ref { hash, .. } => {
             let stored = backend.get(&blob_key(hash)).await?;
-            let bytes = blobs::decode(&stored)?;
+            // Tree-node blobs are content-addressed: authenticate against the
+            // ref's hash, not the Doc context.
+            let bytes = decode_blob_hash_ctx(crypto, hash, &stored)?;
             let inner: Node =
                 serde_json::from_slice(&bytes).map_err(|source| Error::Malformed {
                     what: format!("tree node {hash}"),
                     source,
                 })?;
-            Box::pin(restore_node(backend, &inner, dir)).await
+            Box::pin(restore_node(backend, crypto, &inner, dir)).await
         }
     }
 }
 
-/// Stream one file's chunks to disk.
-async fn restore_file(backend: &dyn Backend, dest: &Path, chunks: &[String]) -> Result<()> {
+/// Stream one file's chunks to disk. Chunk blobs are content-addressed, so
+/// each is authenticated against its own hash as the AAD context.
+async fn restore_file(
+    backend: &dyn Backend,
+    crypto: Option<&RepoCrypto>,
+    dest: &Path,
+    chunks: &[String],
+) -> Result<()> {
     if let Some(parent) = dest.parent() {
         tokio::fs::create_dir_all(parent)
             .await
@@ -580,7 +793,7 @@ async fn restore_file(backend: &dyn Backend, dest: &Path, chunks: &[String]) -> 
             return Err(Error::MissingBlob(hex.clone()));
         }
         let stored = backend.get(&key).await?;
-        let bytes = blobs::decode(&stored)?;
+        let bytes = decode_blob_hash_ctx(crypto, hex, &stored)?;
         writer
             .write_all(&bytes)
             .await

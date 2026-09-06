@@ -10,7 +10,7 @@
 //! use aegis_core::{ChunkerConfig, LocalBackend, Repository};
 //!
 //! let backend = Box::new(LocalBackend::new("/srv/backups"));
-//! let repo = Repository::init(backend, ChunkerConfig::default()).await?;
+//! let repo = Repository::init(backend, ChunkerConfig::default(), "passphrase").await?;
 //! let snapshot = repo.backup(&["/etc".into()]).await?;
 //! repo.restore(&snapshot.id, "/tmp/restored").await?;
 //! # Ok(())
@@ -22,7 +22,9 @@
 pub mod backend;
 pub mod blobs;
 pub mod chunk;
+pub mod crypto;
 pub mod error;
+pub mod keys;
 pub mod repo;
 pub mod snapshot;
 pub mod tree;
@@ -30,6 +32,7 @@ pub mod tree;
 pub use backend::{Backend, LocalBackend};
 pub use chunk::{Chunk, ChunkHash, ChunkerConfig};
 pub use error::{Error, Result};
+pub use keys::{AeadContext, KeyFile, PassphraseSource, RepoCrypto};
 pub use repo::{RepoConfig, Repository, FORMAT_VERSION};
 pub use snapshot::{BlobKind, BlobRef, Snapshot, SnapshotIndex, SnapshotStats};
 pub use tree::{Node, INLINE_LIMIT};

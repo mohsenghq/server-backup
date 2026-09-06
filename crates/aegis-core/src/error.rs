@@ -56,6 +56,31 @@ pub enum Error {
     #[error("decompression failed: {0}")]
     DecompressFailed(String),
 
+    /// Argon2id key derivation failed.
+    #[error("key derivation failed: {0}")]
+    KdfFailed(String),
+
+    /// Encrypting data before storage failed.
+    #[error("encryption failed: {0}")]
+    EncryptFailed(String),
+
+    /// Decrypting stored data failed: wrong key or corrupted ciphertext.
+    #[error("decryption failed: {0}")]
+    DecryptFailed(String),
+
+    /// The supplied passphrase does not open this repository.
+    #[error("wrong passphrase")]
+    WrongPassphrase,
+
+    /// No passphrase is available (set `AEGIS_PASSPHRASE` or type one when
+    /// prompted).
+    #[error("no passphrase available (set AEGIS_PASSPHRASE or run interactively)")]
+    NoPassphrase,
+
+    /// A key slot referenced by the repository is missing or invalid.
+    #[error("key slot error: {0}")]
+    KeyError(String),
+
     /// Stored JSON (a repo config or snapshot manifest) could not be parsed.
     #[error("malformed {what}: {source}")]
     Malformed {
