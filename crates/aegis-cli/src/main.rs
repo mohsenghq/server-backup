@@ -89,6 +89,35 @@ enum Command {
         target: PathBuf,
     },
 
+    /// Apply retention rules and garbage-collect unreferenced blobs. The
+    /// only destructive command: run with --dry-run first to see what would
+    /// be removed.
+    Prune {
+        /// Repository to prune.
+        #[arg(long, value_name = "PATH")]
+        repo: PathBuf,
+
+        /// Show what would be deleted without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Keep the newest snapshot of each of the last N calendar days.
+        #[arg(long, value_name = "N", default_value_t = 7)]
+        keep_daily: u32,
+
+        /// Keep the newest snapshot of each of the last N ISO weeks.
+        #[arg(long, value_name = "N", default_value_t = 4)]
+        keep_weekly: u32,
+
+        /// Keep the newest snapshot of each of the last N calendar months.
+        #[arg(long, value_name = "N", default_value_t = 6)]
+        keep_monthly: u32,
+
+        /// Always keep the N most recent snapshots, however old.
+        #[arg(long, value_name = "N", default_value_t = 3)]
+        keep_last: u32,
+    },
+
     /// Check a snapshot's integrity. Shallow (default) confirms every
     /// referenced blob is present and the manifest's tree hash matches;
     /// --deep additionally downloads and re-derives all of them.
@@ -231,6 +260,57 @@ async fn main() -> Result<()> {
                     );
                 },
             );
+        }
+
+        Command::Prune {
+            repo,
+            dry_run,
+            keep_daily,
+            keep_weekly,
+            keep_monthly,
+            keep_last,
+        } => {
+            let r = open(&repo).await?;
+            let policy = aegis_core::retention::RetentionPolicy {
+                keep_daily,
+                keep_weekly,
+                keep_monthly,
+                keep_last,
+            };
+            let report = r
+                .prune(&policy, dry_run)
+                .await
+                .context("pruning repository")?;
+            emit(cli.json, &report, || {
+                if dry_run {
+                    println!(
+                        "dry run — {} snapshot(s) and {} blob(s) would be removed:",
+                        report.deleted_snapshots.len(),
+                        report.deleted_blobs.len()
+                    );
+                } else {
+                    println!(
+                        "pruned {} snapshot(s) and {} blob(s) ({})",
+                        report.deleted_snapshots.len(),
+                        report.deleted_blobs.len(),
+                        human_bytes(report.deleted_blob_bytes)
+                    );
+                }
+                println!(
+                    "kept {} snapshot(s): {}",
+                    report.kept_snapshots.len(),
+                    if report.kept_snapshots.is_empty() {
+                        "none".to_string()
+                    } else {
+                        report
+                            .kept_snapshots
+                            .iter()
+                            .map(|id| id[..8.min(id.len())].to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    }
+                );
+            });
         }
 
         Command::Verify {

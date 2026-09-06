@@ -12,6 +12,7 @@ use crate::chunk::{chunk_stream, ChunkerConfig};
 use crate::crypto::KdfParams;
 use crate::error::{Error, Result};
 use crate::keys::{AeadContext, KeyFile, RepoCrypto};
+use crate::retention::{self, RetentionPolicy};
 use crate::snapshot::{BlobKind, BlobRef, Snapshot, SnapshotIndex, SnapshotStats};
 use crate::tree::{self, Node};
 
@@ -598,6 +599,84 @@ impl Repository {
         })
     }
 
+    /// Apply `policy` and garbage-collect: delete snapshots the policy drops,
+    /// then every blob that no surviving snapshot references.
+    ///
+    /// With `dry_run` the repository is not modified — the returned report
+    /// describes exactly what a real run would delete, so the CLI can show
+    /// the damage before it happens (`docs/03`: prune is the only destructive
+    /// path and must be explicit).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if the backend fails to list or delete, and
+    /// [`Error::Malformed`] if a manifest cannot be parsed.
+    pub async fn prune(&self, policy: &RetentionPolicy, dry_run: bool) -> Result<PruneReport> {
+        let all = self.list_snapshots().await?;
+        let decision = retention::apply_policy(&all, policy);
+
+        // Reachability: the union of every blob referenced by a KEPT
+        // snapshot, whatever the blob's age or which run wrote it.
+        let mut live: HashSet<String> = HashSet::new();
+        for snapshot in &decision.kept {
+            let index = self.snapshot_index(snapshot).await?;
+            for blob in index.blobs {
+                live.insert(blob.hash);
+            }
+        }
+
+        // Every blob physically present in the repository.
+        let mut present: HashSet<String> = HashSet::new();
+        for key in self.backend.list(BLOBS_PREFIX).await? {
+            if let Some(hex) = key
+                .strip_prefix("blobs/")
+                .and_then(|rest| rest.split('/').next_back())
+            {
+                present.insert(hex.to_string());
+            }
+        }
+
+        // Candidates: present-but-unreferenced. Blob keys are content
+        // addresses, so a blob missing from `live` is garbage regardless of
+        // which snapshot wrote it.
+        let mut garbage: Vec<String> = present
+            .iter()
+            .filter(|hex| !live.contains(*hex))
+            .cloned()
+            .collect();
+        garbage.sort();
+
+        let mut report = PruneReport {
+            dry_run,
+            kept_snapshots: decision.kept.iter().map(|s| s.id.clone()).collect(),
+            deleted_snapshots: decision.pruned.iter().map(|s| s.id.clone()).collect(),
+            deleted_blobs: garbage,
+            ..PruneReport::default()
+        };
+
+        if dry_run {
+            return Ok(report);
+        }
+
+        // Order matters: delete blobs only after the manifests of the
+        // snapshots that owned them. A crash mid-prune then leaves at worst
+        // an orphan blob (the next prune collects it) — never a live snapshot
+        // pointing at a missing blob.
+        let mut bytes = 0u64;
+        for id in &report.deleted_snapshots {
+            self.backend.delete(&snapshot_key(id)).await?;
+            self.backend.delete(&index_key(id)).await?;
+        }
+        for hex in &report.deleted_blobs {
+            if let Ok(stored) = self.backend.get(&blob_key(hex)).await {
+                bytes += stored.len() as u64;
+            }
+            self.backend.delete(&blob_key(hex)).await?;
+        }
+        report.deleted_blob_bytes = bytes;
+        Ok(report)
+    }
+
     /// Check a snapshot's integrity.
     ///
     /// Shallow mode checks only what the inline manifest commits to without
@@ -957,6 +1036,21 @@ async fn verify_descend(
             Ok(())
         }
     }
+}
+
+/// Result of [`Repository::prune`].
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct PruneReport {
+    /// Whether anything was deleted (`false` for a dry run).
+    pub dry_run: bool,
+    /// Snapshots that survived, newest first.
+    pub kept_snapshots: Vec<String>,
+    /// Snapshots the retention policy removed.
+    pub deleted_snapshots: Vec<String>,
+    /// Blob hashes garbage-collected (or that a real run would remove).
+    pub deleted_blobs: Vec<String>,
+    /// Stored bytes reclaimed by the blob deletions.
+    pub deleted_blob_bytes: u64,
 }
 
 /// Result of [`Repository::verify`].

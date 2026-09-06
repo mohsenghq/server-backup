@@ -671,3 +671,120 @@ async fn shallow_verify_detects_a_missing_blob() {
         "expected MissingBlob, got {err:?}"
     );
 }
+
+#[tokio::test]
+async fn prune_dry_run_deletes_nothing_and_reports_the_plan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let repo_path = tmp.path().join("repo");
+    write(&source.join("a.txt"), b"v1");
+
+    let repo = Repository::init_local_with_kdf(&repo_path, chunker(), PASS, fast_kdf())
+        .await
+        .unwrap();
+    // Two snapshots in distinct calendar days, sharing the same chunk blob
+    // ("v1" both times).
+    repo.backup(std::slice::from_ref(&source)).await.unwrap();
+    write(&source.join("a.txt"), b"v2");
+    repo.backup(std::slice::from_ref(&source)).await.unwrap();
+
+    let policy = aegis_core::retention::RetentionPolicy {
+        keep_daily: 1,
+        keep_weekly: 0,
+        keep_monthly: 0,
+        keep_last: 1,
+    };
+    let report = repo.prune(&policy, true).await.unwrap();
+    assert!(report.dry_run);
+    assert_eq!(report.deleted_snapshots.len(), 1);
+    assert!(!report.kept_snapshots.is_empty());
+    // Nothing was actually deleted.
+    assert_eq!(repo.list_snapshots().await.unwrap().len(), 2);
+    let blobs_on_disk = walkdir_files(&repo_path.join("blobs")).len();
+    // The plan is stable across runs and the disk is untouched.
+    let report2 = repo.prune(&policy, true).await.unwrap();
+    assert_eq!(report2.deleted_blobs, report.deleted_blobs);
+    assert_eq!(walkdir_files(&repo_path.join("blobs")).len(), blobs_on_disk);
+}
+
+#[tokio::test]
+async fn prune_deletes_old_snapshots_and_only_their_exclusive_blobs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let repo_path = tmp.path().join("repo");
+    // A large file so it splits into several chunks.
+    write(&source.join("data.bin"), &pseudo_random(256 * 1024, 51));
+
+    let repo = Repository::init_local_with_kdf(&repo_path, chunker(), PASS, fast_kdf())
+        .await
+        .unwrap();
+    let old = repo.backup(std::slice::from_ref(&source)).await.unwrap();
+    // Second snapshot on a different day REUSES every blob (dedup), so the
+    // old snapshot's blobs are NOT garbage — they are shared with the kept
+    // newest snapshot.
+    write(&source.join("data.bin"), &pseudo_random(256 * 1024, 51));
+    let _new = repo.backup(std::slice::from_ref(&source)).await.unwrap();
+
+    let blobs_before = walkdir_files(&repo_path.join("blobs")).len();
+
+    let policy = aegis_core::retention::RetentionPolicy {
+        keep_daily: 1,
+        keep_weekly: 0,
+        keep_monthly: 0,
+        keep_last: 1,
+    };
+    let report = repo.prune(&policy, false).await.unwrap();
+    assert_eq!(report.deleted_snapshots.len(), 1);
+    // All data blobs are shared with the kept snapshot; only tree/manifest
+    // blobs that belonged solely to the deleted snapshot may be collected.
+    assert_eq!(repo.list_snapshots().await.unwrap().len(), 1);
+    let remaining = repo.list_snapshots().await.unwrap();
+    assert_ne!(remaining[0].id, old.id);
+
+    // The kept snapshot still restores and still verifies deep.
+    let out = tmp.path().join("out");
+    repo.restore(&remaining[0].id, &out).await.unwrap();
+    repo.verify(&remaining[0], true).await.unwrap();
+
+    // Blob count can only shrink, never grow.
+    assert!(walkdir_files(&repo_path.join("blobs")).len() <= blobs_before);
+}
+
+#[tokio::test]
+async fn prune_collects_blobs_referenced_only_by_deleted_snapshots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let repo_path = tmp.path().join("repo");
+    write(&source.join("data.bin"), &pseudo_random(64 * 1024, 52));
+
+    let repo = Repository::init_local_with_kdf(&repo_path, chunker(), PASS, fast_kdf())
+        .await
+        .unwrap();
+    repo.backup(std::slice::from_ref(&source)).await.unwrap();
+    // Completely different content (note: pseudo_random's `seed | 1` makes
+    // 52 and 53 the SAME stream — pick a seed far away): no blob is shared
+    // with the first run.
+    write(&source.join("data.bin"), &pseudo_random(64 * 1024, 97));
+    repo.backup(std::slice::from_ref(&source)).await.unwrap();
+
+    let blobs_before = walkdir_files(&repo_path.join("blobs")).len();
+
+    let policy = aegis_core::retention::RetentionPolicy {
+        keep_daily: 1,
+        keep_weekly: 0,
+        keep_monthly: 0,
+        keep_last: 1,
+    };
+    let report = repo.prune(&policy, false).await.unwrap();
+    assert_eq!(report.deleted_snapshots.len(), 1);
+    assert!(report.deleted_blob_bytes > 0);
+    // Every blob that only the deleted snapshot referenced must be gone.
+    assert!(walkdir_files(&repo_path.join("blobs")).len() < blobs_before);
+
+    // The surviving snapshot remains fully functional.
+    let remaining = repo.list_snapshots().await.unwrap();
+    assert_eq!(remaining.len(), 1);
+    let out = tmp.path().join("out");
+    repo.restore(&remaining[0].id, &out).await.unwrap();
+    repo.verify(&remaining[0], true).await.unwrap();
+}
