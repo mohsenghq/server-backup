@@ -34,4 +34,9 @@ zstd.workspace = true
 tempfile.workspace = true
 walkdir.workspace = true
 proptest = "1"
+criterion = "0.5"
 tokio = { workspace = true, features = ["rt", "macros"] }
+
+[[bench]]
+name = "bench"
+harness = false

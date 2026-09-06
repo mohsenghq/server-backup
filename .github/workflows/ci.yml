@@ -35,3 +35,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # The benchmark suite must always compile and run; criterion baselines are
+  # not persisted across runs (no dedicated bench runner), so this job acts
+  # as a smoke test for the benchmarks rather than a regression gate.
+  # Comparisons against docs/11-performance-targets.md happen on demand:
+  #   cargo bench -p aegis-core -- --save-baseline main
+  bench:
+    name: benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Benchmarks need the optimized build of every dependency; cache
+          # them separately from the test job's debug artifacts.
+          key: bench
+      - run: cargo bench --workspace --no-run
+      - name: Smoke-run benchmarks (reduced sampling)
+        run: cargo bench -p aegis-core --bench bench -- --warm-up-time 0.2 --measurement-time 0.8
