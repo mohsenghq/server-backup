@@ -99,6 +99,23 @@ pub enum Error {
     /// A chunker configuration violated FastCDC's size invariants.
     #[error("invalid chunker configuration: {0}")]
     InvalidChunkerConfig(String),
+
+    /// An SSH transport, authentication or SFTP protocol failure.
+    #[error("ssh error: {0}")]
+    Ssh(String),
+
+    /// The server's host key changed since it was first recorded.
+    ///
+    /// This is the classic machine-in-the-middle signal; the session is
+    /// refused rather than silently re-recording the key.
+    #[error(
+        "host key for {host} changed (possible man-in-the-middle attack); \
+             remove the old entry from your known_hosts to accept the new key"
+    )]
+    HostKeyChanged {
+        /// The `host:port` whose key changed.
+        host: String,
+    },
 }
 
 /// Convenience alias for results returned by this crate.

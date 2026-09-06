@@ -11,7 +11,6 @@
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 
-use crate::backend::Backend;
 use crate::crypto::{self, KdfParams, WrappedKey, KEY_LEN, NONCE_LEN, SALT_LEN};
 use crate::error::{Error, Result};
 
@@ -168,8 +167,25 @@ pub async fn key_add(
     current_passphrase: &str,
     new_passphrase: &str,
 ) -> Result<String> {
-    let backend = crate::backend::LocalBackend::new(path);
-    // Read config only to find the current slot (open_local would also do).
+    key_add_backend(
+        Box::new(crate::backend::LocalBackend::new(path)),
+        current_passphrase,
+        new_passphrase,
+    )
+    .await
+}
+
+/// [`key_add`] against an arbitrary backend (e.g. an SFTP repository).
+///
+/// # Errors
+///
+/// Same as [`key_add`].
+pub async fn key_add_backend(
+    backend: Box<dyn crate::backend::Backend>,
+    current_passphrase: &str,
+    new_passphrase: &str,
+) -> Result<String> {
+    // Read config only to find the current slot (opening would also do).
     let raw = backend.get("config").await?;
     let config: crate::repo::RepoConfig =
         serde_json::from_slice(&raw).map_err(|e| Error::Malformed {

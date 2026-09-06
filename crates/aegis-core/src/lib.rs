@@ -27,6 +27,7 @@ pub mod error;
 pub mod keys;
 pub mod repo;
 pub mod retention;
+pub mod sftp;
 pub mod snapshot;
 pub mod tree;
 
