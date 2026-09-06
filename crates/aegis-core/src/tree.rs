@@ -126,6 +126,26 @@ impl Node {
         }
     }
 
+    /// Collect every hash reachable from this subtree without fetching any
+    /// node blob: data chunk hashes from inline file nodes into `chunks`, and
+    /// [`Node::Ref`] blob hashes into `tree_blobs`. Refs are not descended
+    /// into — resolving them requires the very blobs a corruption check must
+    /// fetch (see `Repository::verify`).
+    pub fn collect_all_hashes(&self, chunks: &mut Vec<String>, tree_blobs: &mut Vec<String>) {
+        match self {
+            Node::File {
+                chunks: file_chunks,
+                ..
+            } => chunks.extend(file_chunks.iter().cloned()),
+            Node::Ref { hash, .. } => tree_blobs.push(hash.clone()),
+            Node::Dir { children, .. } => {
+                children
+                    .iter()
+                    .for_each(|c| c.collect_all_hashes(chunks, tree_blobs));
+            }
+        }
+    }
+
     /// Canonical serialization of this node — the bytes every hash and blob
     /// is taken over. Never called on an unsorted tree by the builder; direct
     /// callers should [`Node::sort`] first.
@@ -136,6 +156,14 @@ impl Node {
     /// The BLAKE3 hash of [`Node::serialized`], hex-encoded.
     pub fn hash_hex(&self) -> String {
         blake3::hash(&self.serialized()).to_hex().to_string()
+    }
+
+    /// Check a previously committed root hash: `expected` must equal this
+    /// node's [`Node::hash_hex`]. This is the check `aegis verify` runs on
+    /// every snapshot: if it holds, the manifest's tree is byte-for-byte what
+    /// the backup produced.
+    pub fn verify_root_hash(&self, expected: &str) -> bool {
+        self.hash_hex() == expected
     }
 }
 
@@ -181,6 +209,13 @@ pub fn build_stored(root: Node) -> Result<(Node, NodeBlobs)> {
     let mut blobs = Vec::new();
     let root = go(root, &mut blobs)?;
     Ok((root, blobs))
+}
+
+/// Check a stored node blob: its canonical serialization must hash to
+/// `expected`. Deep `aegis verify` re-derives every node blob this way —
+/// an attacker-flipped bit anywhere in the tree fails authentication here.
+pub fn verify_node_blob(expected: &str, bytes: &[u8]) -> bool {
+    blake3::hash(bytes).to_hex().to_string() == expected
 }
 
 /// Reject anything that is not a safe single path component.

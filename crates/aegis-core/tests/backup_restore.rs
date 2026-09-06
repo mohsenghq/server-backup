@@ -578,3 +578,96 @@ async fn snapshot_index_fallback_walks_the_tree_when_index_is_missing() {
         );
     }
 }
+
+#[tokio::test]
+async fn shallow_and_deep_verify_pass_on_a_healthy_snapshot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let repo_path = tmp.path().join("repo");
+    write(&source.join("a.bin"), &pseudo_random(64 * 1024, 41));
+    // Large enough that its file node exceeds INLINE_LIMIT and is stored as
+    // its own tree blob (the many chunk hashes blow past 4 KiB of JSON).
+    write(&source.join("sub/b.bin"), &pseudo_random(512 * 1024, 42));
+
+    let repo = Repository::init_local_with_kdf(&repo_path, chunker(), PASS, fast_kdf())
+        .await
+        .unwrap();
+    let snapshot = repo.backup(std::slice::from_ref(&source)).await.unwrap();
+
+    let shallow = repo.verify(&snapshot, false).await.unwrap();
+    assert_eq!(shallow.snapshot_id, snapshot.id);
+    assert!(shallow.files >= 2);
+    assert!(shallow.chunks >= 2);
+    assert!(
+        shallow.tree_blobs >= 1,
+        "the nested dir must be a tree blob"
+    );
+
+    let deep = repo.verify(&snapshot, true).await.unwrap();
+    assert!(deep.deep);
+    assert_eq!(deep.chunks, shallow.chunks);
+    assert_eq!(deep.tree_blobs, shallow.tree_blobs);
+}
+
+#[tokio::test]
+async fn deep_verify_detects_a_tampered_data_chunk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let repo_path = tmp.path().join("repo");
+    write(&source.join("data.bin"), &pseudo_random(64 * 1024, 43));
+
+    let repo = Repository::init_local_with_kdf(&repo_path, chunker(), PASS, fast_kdf())
+        .await
+        .unwrap();
+    let snapshot = repo.backup(std::slice::from_ref(&source)).await.unwrap();
+
+    // Corrupt one blob, then check shallow passes (presence only) while deep
+    // fails (contents are re-derived and authenticated).
+    let blob_path = walkdir_files(&repo_path.join("blobs"))
+        .pop()
+        .expect("repo has blobs");
+    let mut bytes = std::fs::read(&blob_path).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    std::fs::write(&blob_path, bytes).unwrap();
+
+    repo.verify(&snapshot, false).await.unwrap();
+    let err = repo.verify(&snapshot, true).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            aegis_core::Error::DecryptFailed(_)
+                | aegis_core::Error::DecompressFailed(_)
+                | aegis_core::Error::MalformedBlob(_)
+                | aegis_core::Error::CorruptBlob(_)
+        ),
+        "expected an integrity error, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn shallow_verify_detects_a_missing_blob() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let repo_path = tmp.path().join("repo");
+    write(&source.join("data.bin"), &pseudo_random(64 * 1024, 44));
+
+    let repo = Repository::init_local_with_kdf(&repo_path, chunker(), PASS, fast_kdf())
+        .await
+        .unwrap();
+    let snapshot = repo.backup(std::slice::from_ref(&source)).await.unwrap();
+    drop(repo);
+
+    // Delete a blob behind the repository's back, then reopen.
+    let blob_path = walkdir_files(&repo_path.join("blobs"))
+        .pop()
+        .expect("repo has blobs");
+    std::fs::remove_file(&blob_path).unwrap();
+    let repo = Repository::open_local(&repo_path, PASS).await.unwrap();
+
+    let err = repo.verify(&snapshot, false).await.unwrap_err();
+    assert!(
+        matches!(err, aegis_core::Error::MissingBlob(_)),
+        "expected MissingBlob, got {err:?}"
+    );
+}

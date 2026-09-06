@@ -11,7 +11,7 @@
 use std::path::PathBuf;
 
 use aegis_core::{ChunkerConfig, PassphraseSource, Repository};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 
 /// Self-hosted, deduplicating, multi-server backup.
@@ -87,6 +87,25 @@ enum Command {
         /// Directory to restore into. Created if it does not exist.
         #[arg(long, value_name = "PATH")]
         target: PathBuf,
+    },
+
+    /// Check a snapshot's integrity. Shallow (default) confirms every
+    /// referenced blob is present and the manifest's tree hash matches;
+    /// --deep additionally downloads and re-derives all of them.
+    Verify {
+        /// Repository to check.
+        #[arg(long, value_name = "PATH")]
+        repo: PathBuf,
+
+        /// Snapshot id, or any unambiguous prefix of one. Omit to verify the
+        /// newest snapshot.
+        #[arg(long, value_name = "ID")]
+        snapshot: Option<String>,
+
+        /// Re-derive every blob: download chunks and tree nodes, authenticate,
+        /// decompress/decrypt, and re-check their hashes.
+        #[arg(long)]
+        deep: bool,
     },
 }
 
@@ -212,6 +231,41 @@ async fn main() -> Result<()> {
                     );
                 },
             );
+        }
+
+        Command::Verify {
+            repo,
+            snapshot,
+            deep,
+        } => {
+            let r = open(&repo).await?;
+            let s = match snapshot {
+                Some(id) => r
+                    .find_snapshot(&id)
+                    .await
+                    .with_context(|| format!("finding snapshot {id}"))?,
+                None => r
+                    .list_snapshots()
+                    .await
+                    .context("listing snapshots")?
+                    .into_iter()
+                    .next()
+                    .context(anyhow!("repository has no snapshots to verify"))?,
+            };
+            let report = r
+                .verify(&s, deep)
+                .await
+                .context("verifying snapshot integrity")?;
+            emit(cli.json, &report, || {
+                println!(
+                    "{} check of snapshot {}: OK — {} files, {} chunks, {} tree blobs",
+                    if deep { "deep" } else { "shallow" },
+                    s.short_id(),
+                    report.files,
+                    report.chunks,
+                    report.tree_blobs
+                );
+            });
         }
     }
     Ok(())

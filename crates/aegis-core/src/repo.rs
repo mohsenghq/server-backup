@@ -598,6 +598,104 @@ impl Repository {
         })
     }
 
+    /// Check a snapshot's integrity.
+    ///
+    /// Shallow mode checks only what the inline manifest commits to without
+    /// fetching any node blob: tree names validate, the recomputed root hash
+    /// matches, and every data chunk and tree blob the snapshot references is
+    /// present in the repository. Deep mode additionally downloads and
+    /// re-derives every node blob (`docs/03-repository-format.md`: hashes are
+    /// recomputed and the tree re-derived), then re-checks every data chunk's
+    /// hash against its stored ciphertext.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SnapshotNotFound`], [`Error::BadPath`],
+    /// [`Error::MissingBlob`], or [`Error::CorruptBlob`] for the first
+    /// inconsistency found.
+    pub async fn verify(&self, snapshot: &Snapshot, deep: bool) -> Result<VerifyReport> {
+        snapshot.root.validate()?;
+
+        // Shallow: recompute the root hash the manifest commits to.
+        let expected = snapshot.root_hash();
+        if !snapshot.root.verify_root_hash(&expected) {
+            return Err(Error::CorruptBlob(format!(
+                "snapshot {} root hash mismatch (manifest says {expected})",
+                snapshot.id
+            )));
+        }
+
+        let mut chunks = Vec::new();
+        let mut tree_blobs = Vec::new();
+        snapshot
+            .root
+            .collect_all_hashes(&mut chunks, &mut tree_blobs);
+
+        // Every referenced blob must exist. Deep mode fetches as it goes and
+        // checks each blob's stored bytes against its address.
+        let mut seen = HashSet::new();
+        for hash in &chunks {
+            if !seen.insert(hash.clone()) {
+                continue;
+            }
+            let key = blob_key(hash);
+            if !self.backend.exists(&key).await? {
+                return Err(Error::MissingBlob(hash.clone()));
+            }
+            if deep {
+                let stored = self.backend.get(&key).await?;
+                decode_blob_hash_ctx(self.crypto.as_ref(), hash, &stored)?;
+            }
+        }
+        let mut fetched: HashMap<String, Node> = HashMap::new();
+        for hash in &tree_blobs {
+            if !seen.insert(hash.clone()) {
+                continue;
+            }
+            let key = blob_key(hash);
+            if !self.backend.exists(&key).await? {
+                return Err(Error::MissingBlob(hash.clone()));
+            }
+            if deep {
+                let stored = self.backend.get(&key).await?;
+                let bytes = decode_blob_hash_ctx(self.crypto.as_ref(), hash, &stored)?;
+                if !tree::verify_node_blob(hash, &bytes) {
+                    return Err(Error::CorruptBlob(format!(
+                        "tree node {hash} does not hash to its address"
+                    )));
+                }
+                let node: Node =
+                    serde_json::from_slice(&bytes).map_err(|source| Error::Malformed {
+                        what: format!("tree node {hash}"),
+                        source,
+                    })?;
+                node.validate()?;
+                fetched.insert(hash.clone(), node);
+            }
+        }
+
+        if deep {
+            // Every ref in the inline root must resolve to a fetchable,
+            // well-formed node whose serialization hashes to its address —
+            // recursively, so the whole tree below the manifest is re-derived.
+            verify_descend(
+                self.backend.as_ref(),
+                self.crypto.as_ref(),
+                &snapshot.root,
+                &mut fetched,
+            )
+            .await?;
+        }
+
+        Ok(VerifyReport {
+            snapshot_id: snapshot.id.clone(),
+            files: snapshot.count_files(),
+            chunks: chunks.len() as u64,
+            tree_blobs: tree_blobs.len() as u64,
+            deep,
+        })
+    }
+
     /// Restore a snapshot's files beneath `target`.
     ///
     /// File contents are streamed chunk-by-chunk to disk; peak memory is
@@ -815,6 +913,65 @@ fn safe_join(base: &Path, rel: &str) -> Result<std::path::PathBuf> {
         out.push(seg);
     }
     Ok(out)
+}
+
+/// Re-derive the tree below the inline root: every [`Node::Ref`] must resolve
+/// (through `fetched` or a live backend fetch) to a node that hashes to its
+/// own address, and so on recursively.
+async fn verify_descend(
+    backend: &dyn Backend,
+    crypto: Option<&RepoCrypto>,
+    node: &Node,
+    fetched: &mut HashMap<String, Node>,
+) -> Result<()> {
+    match node {
+        Node::File { .. } => Ok(()),
+        Node::Ref { hash, .. } => {
+            if fetched.contains_key(hash) {
+                return Ok(()); // already verified and expanded
+            }
+            let key = blob_key(hash);
+            let stored = backend
+                .get(&key)
+                .await
+                .map_err(|_| Error::MissingBlob(hash.clone()))?;
+            let bytes = decode_blob_hash_ctx(crypto, hash, &stored)?;
+            if !tree::verify_node_blob(hash, &bytes) {
+                return Err(Error::CorruptBlob(format!(
+                    "tree node {hash} does not hash to its address"
+                )));
+            }
+            let inner: Node =
+                serde_json::from_slice(&bytes).map_err(|source| Error::Malformed {
+                    what: format!("tree node {hash}"),
+                    source,
+                })?;
+            inner.validate()?;
+            fetched.insert(hash.clone(), inner.clone());
+            Box::pin(verify_descend(backend, crypto, &inner, fetched)).await
+        }
+        Node::Dir { children, .. } => {
+            for child in children {
+                Box::pin(verify_descend(backend, crypto, child, fetched)).await?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Result of [`Repository::verify`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct VerifyReport {
+    /// Snapshot that was checked.
+    pub snapshot_id: String,
+    /// Files counted in the snapshot tree.
+    pub files: u64,
+    /// Distinct data chunk hashes referenced.
+    pub chunks: u64,
+    /// Distinct tree-node blob hashes referenced from the inline root.
+    pub tree_blobs: u64,
+    /// Whether contents were fully re-derived (deep check).
+    pub deep: bool,
 }
 
 /// Key of a data or tree-node blob, sharded by the first two hex characters of

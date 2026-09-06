@@ -56,6 +56,11 @@ pub enum Error {
     #[error("decompression failed: {0}")]
     DecompressFailed(String),
 
+    /// Stored content does not hash to its address, or a manifest's committed
+    /// hash does not match the tree it accompanies (detected by `verify`).
+    #[error("corrupted content: {0}")]
+    CorruptBlob(String),
+
     /// Argon2id key derivation failed.
     #[error("key derivation failed: {0}")]
     KdfFailed(String),
