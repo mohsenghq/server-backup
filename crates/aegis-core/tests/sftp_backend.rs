@@ -96,7 +96,7 @@ async fn init_backup_restore_over_sftp() {
     let src = tempfile::tempdir().unwrap();
     let remote = tempfile::tempdir().unwrap();
     let out = tempfile::tempdir().unwrap();
-    write_tree(&src.path());
+    write_tree(src.path());
 
     let (backend, port) = connected_backend(remote.path().to_path_buf())
         .await
@@ -121,7 +121,7 @@ async fn init_backup_restore_over_sftp() {
 
     assert_eq!(
         read_tree(&out.path().join("restored")),
-        read_tree(&src.path()),
+        read_tree(src.path()),
     );
     let _ = port;
 }
@@ -202,7 +202,7 @@ async fn prune_over_sftp() {
 
     let out = tempfile::tempdir().unwrap();
     repo.restore(&s2.id, out.path()).await.unwrap();
-    assert_eq!(read_tree(&out.path())[0].1, b"prune me over sftp".to_vec());
+    assert_eq!(read_tree(out.path())[0].1, b"prune me over sftp".to_vec());
     let _ = report;
 }
 
@@ -210,7 +210,7 @@ async fn prune_over_sftp() {
 async fn wrong_repo_passphrase_over_sftp() {
     let src = tempfile::tempdir().unwrap();
     let remote = tempfile::tempdir().unwrap();
-    write_tree(&src.path());
+    write_tree(src.path());
 
     let (backend, _) = connected_backend(remote.path().to_path_buf())
         .await
