@@ -7,10 +7,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+argon2.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
+chacha20poly1305.workspace = true
 fastcdc.workspace = true
 hostname.workspace = true
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -18,6 +21,7 @@ time.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 walkdir.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

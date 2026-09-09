@@ -22,6 +22,13 @@ struct Cli {
     command: Command,
 }
 
+/// Where the repository passphrase comes from.
+///
+/// Precedence: `--passphrase-file`, then `AEGIS_PASSPHRASE`, then an error —
+/// the CLI never takes a passphrase as a command-line argument, where it would
+/// land in shell history. Interactive TTY prompting arrives with the Phase 3
+/// server auth work, which needs the same dialog code.
+
 #[derive(Subcommand)]
 enum Command {
     /// Create a new, empty repository.
@@ -41,6 +48,9 @@ enum Command {
         /// Maximum chunk size in bytes. Fixed for the life of the repository.
         #[arg(long, value_name = "BYTES", default_value_t = aegis_core::chunk::DEFAULT_MAX_SIZE)]
         max_chunk_size: usize,
+
+        #[command(flatten)]
+        passphrase: PassphraseArgs,
     },
 
     /// Back up one or more paths into a repository as a new snapshot.
@@ -52,6 +62,9 @@ enum Command {
         /// Repository to write the snapshot into.
         #[arg(long, value_name = "PATH")]
         repo: PathBuf,
+
+        #[command(flatten)]
+        passphrase: PassphraseArgs,
     },
 
     /// List the snapshots in a repository, newest first.
@@ -59,6 +72,9 @@ enum Command {
         /// Repository to read.
         #[arg(long, value_name = "PATH")]
         repo: PathBuf,
+
+        #[command(flatten)]
+        passphrase: PassphraseArgs,
     },
 
     /// Restore a snapshot's files into a target directory.
@@ -74,7 +90,32 @@ enum Command {
         /// Directory to restore into. Created if it does not exist.
         #[arg(long, value_name = "PATH")]
         target: PathBuf,
+
+        #[command(flatten)]
+        passphrase: PassphraseArgs,
     },
+}
+
+/// Passphrase options shared by every repository-touching command.
+#[derive(clap::Args, Clone, Debug)]
+struct PassphraseArgs {
+    /// File containing the repository passphrase (first line; trailing
+    /// newline stripped). Takes precedence over AEGIS_PASSPHRASE.
+    #[arg(long, value_name = "FILE")]
+    passphrase_file: Option<PathBuf>,
+}
+
+impl PassphraseArgs {
+    /// Resolve the passphrase: `--passphrase-file` first, then `AEGIS_PASSPHRASE`.
+    fn read(&self) -> Result<String> {
+        if let Some(path) = &self.passphrase_file {
+            let raw = std::fs::read_to_string(path)
+                .with_context(|| format!("reading passphrase file {}", path.display()))?;
+            return Ok(raw.trim_end_matches(['\r', '\n']).to_string());
+        }
+        std::env::var("AEGIS_PASSPHRASE")
+            .context("no passphrase: set AEGIS_PASSPHRASE or pass --passphrase-file")
+    }
 }
 
 #[tokio::main]
@@ -86,9 +127,11 @@ async fn main() -> Result<()> {
             min_chunk_size,
             avg_chunk_size,
             max_chunk_size,
+            passphrase,
         } => {
             let chunker = ChunkerConfig::new(min_chunk_size, avg_chunk_size, max_chunk_size)?;
-            let r = Repository::init(&repo, chunker)
+            let pass = passphrase.read()?;
+            let r = Repository::init(&repo, chunker, &pass)
                 .await
                 .with_context(|| format!("initializing repository at {}", repo.display()))?;
             emit(
@@ -104,8 +147,12 @@ async fn main() -> Result<()> {
             );
         }
 
-        Command::Backup { paths, repo } => {
-            let r = open(&repo).await?;
+        Command::Backup {
+            paths,
+            repo,
+            passphrase,
+        } => {
+            let r = open(&repo, &passphrase.read()?).await?;
             let snapshot = r.backup(&paths).await.context("running backup")?;
             let s = snapshot.stats;
             emit(cli.json, &snapshot, || {
@@ -121,8 +168,8 @@ async fn main() -> Result<()> {
             });
         }
 
-        Command::Snapshots { repo } => {
-            let r = open(&repo).await?;
+        Command::Snapshots { repo, passphrase } => {
+            let r = open(&repo, &passphrase.read()?).await?;
             let snapshots = r.list_snapshots().await.context("listing snapshots")?;
             emit(cli.json, &snapshots, || {
                 if snapshots.is_empty() {
@@ -151,8 +198,9 @@ async fn main() -> Result<()> {
             snapshot,
             repo,
             target,
+            passphrase,
         } => {
-            let r = open(&repo).await?;
+            let r = open(&repo, &passphrase.read()?).await?;
             let s = r
                 .restore(&snapshot, &target)
                 .await
@@ -174,8 +222,8 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn open(repo: &PathBuf) -> Result<Repository> {
-    Repository::open(repo)
+async fn open(repo: &PathBuf, passphrase: &str) -> Result<Repository> {
+    Repository::open(repo, passphrase)
         .await
         .with_context(|| format!("opening repository at {}", repo.display()))
 }

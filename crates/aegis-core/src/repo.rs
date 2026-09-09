@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::{Backend, LocalBackend};
 use crate::chunk::{chunk_stream, ChunkerConfig};
+use crate::crypto::{self, Aad, Key, WrappedKey};
 use crate::error::{Error, Result};
 use crate::snapshot::{Snapshot, SnapshotStats};
 use crate::tree::{self, NodeRef, TreeEntry, TreeNode};
@@ -27,6 +28,7 @@ const CONFIG_KEY: &str = "config";
 const BLOBS_PREFIX: &str = "blobs";
 const SNAPSHOTS_PREFIX: &str = "snapshots";
 const INDEX_PACK_KEY: &str = "index/pack.json";
+const KEYS_PREFIX: &str = "keys";
 
 /// Directories whose serialized form stays below this size are embedded inline
 /// in their parent instead of being written as their own tree blob. Small
@@ -36,9 +38,8 @@ const INLINE_DIR_LIMIT: usize = 4 * 1024;
 
 /// The repository's `config` document.
 ///
-// ponytail: plaintext until the Phase 1 encryption item lands. The security
-// model (`docs/10-security-model.md`) requires this to be encrypted under the
-// repo master key, alongside `keys/`.
+/// Stored **encrypted** under the repo master key (`docs/10-security-model.md`):
+/// the backend never sees the plaintext.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoConfig {
     /// Repository format version — see [`FORMAT_VERSION`].
@@ -86,79 +87,159 @@ impl IndexPack {
 pub struct Repository {
     backend: Box<dyn Backend>,
     config: RepoConfig,
+    /// Repo master key, unwrapped from `keys/` at open time. Seals every blob,
+    /// manifest, and the config. Zeroized on drop.
+    master_key: Key,
     /// Blob→location index. Interior-mutable so backup can stay `&self`
     /// (the server will hand out `Arc<Repository>`).
     index: Mutex<IndexPack>,
 }
 
 impl Repository {
-    /// Create a repository behind a caller-supplied backend.
+    /// Create a repository behind a caller-supplied backend, encrypted under
+    /// a fresh master key wrapped with `passphrase`.
+    ///
+    /// The master key is generated client-side, wrapped via Argon2id +
+    /// XChaCha20-Poly1305, and stored in `keys/` (`docs/10-security-model.md`).
     ///
     /// # Errors
     ///
     /// Returns [`Error::RepoExists`] if a `config` is already present,
-    /// [`Error::InvalidChunkerConfig`] for bad chunker parameters, or
-    /// [`Error::Io`] if the backend cannot be written.
+    /// [`Error::InvalidChunkerConfig`] for bad chunker parameters,
+    /// [`Error::Crypto`] on KDF/AEAD failure, or [`Error::Io`] if the backend
+    /// cannot be written.
     pub async fn init_with_backend(
         backend: Box<dyn Backend>,
         chunker: ChunkerConfig,
+        passphrase: &str,
     ) -> Result<Self> {
         chunker.validate()?;
         if backend.exists(CONFIG_KEY).await? {
             return Err(Error::RepoExists(backend.location()));
         }
+        let master_key = Key::generate();
+        let wrapped = WrappedKey::create(&master_key, passphrase)?;
+        let key_bytes = serde_json::to_vec_pretty(&wrapped).expect("WrappedKey is serializable");
+        backend
+            .put(
+                &format!("{KEYS_PREFIX}/{}.json", wrapped.key_id),
+                &key_bytes,
+            )
+            .await?;
+
         let config = RepoConfig {
             version: FORMAT_VERSION,
             id: uuid::Uuid::new_v4().to_string(),
             chunker,
         };
         let bytes = serde_json::to_vec_pretty(&config).expect("RepoConfig is serializable");
-        backend.put(CONFIG_KEY, &bytes).await?;
+        backend
+            .put(CONFIG_KEY, &crypto::seal(&master_key, &bytes, Aad::Config)?)
+            .await?;
         let repo = Self {
             backend,
             config,
+            master_key,
             index: Mutex::new(IndexPack::default()),
         };
         repo.flush_index().await?;
         Ok(repo)
     }
 
-    /// Open an existing repository behind a caller-supplied backend.
+    /// Open an existing repository behind a caller-supplied backend, unwrapping
+    /// its master key with `passphrase`.
     ///
     /// # Errors
     ///
     /// Returns [`Error::RepoNotFound`] if there is no `config`,
     /// [`Error::UnsupportedFormat`] if it was written by an incompatible
-    /// version, [`Error::Malformed`] if a document cannot be parsed, or
-    /// [`Error::Io`] if the backend cannot be read.
-    pub async fn open_with_backend(backend: Box<dyn Backend>) -> Result<Self> {
+    /// version, [`Error::NoMatchingKey`] if no key file exists,
+    /// [`Error::DecryptionFailed`] for a wrong passphrase or tampered data,
+    /// [`Error::Malformed`] if a document cannot be parsed, or [`Error::Io`]
+    /// if the backend cannot be read.
+    pub async fn open_with_backend(backend: Box<dyn Backend>, passphrase: &str) -> Result<Self> {
         if !backend.exists(CONFIG_KEY).await? {
             return Err(Error::RepoNotFound(backend.location()));
         }
-        let raw = backend.get(CONFIG_KEY).await?;
-        let config: RepoConfig =
-            serde_json::from_slice(&raw).map_err(|source| Error::Malformed {
-                what: "repository config".into(),
-                source,
-            })?;
-        if config.version != FORMAT_VERSION {
-            return Err(Error::UnsupportedFormat {
-                found: config.version,
-                supported: FORMAT_VERSION,
-            });
+        let sealed_config = backend.get(CONFIG_KEY).await?;
+
+        // Try every wrapped key file; any successful unwrap + config open wins.
+        // Wrong passphrases fail AEAD authentication, never leak timing beyond
+        // the KDF (identical work per key).
+        let key_names = backend
+            .list(KEYS_PREFIX)
+            .await?
+            .into_iter()
+            .filter(|k| k.ends_with(".json"));
+        let mut last_error = Error::NoMatchingKey;
+        let mut opened: Option<(RepoConfig, Key)> = None;
+        for key_name in key_names {
+            let raw = match backend.get(&key_name).await {
+                Ok(raw) => raw,
+                Err(e) => {
+                    last_error = e;
+                    continue;
+                }
+            };
+            let wrapped: WrappedKey = match serde_json::from_slice(&raw) {
+                Ok(w) => w,
+                Err(source) => {
+                    last_error = Error::Malformed {
+                        what: format!("key file {key_name}"),
+                        source,
+                    };
+                    continue;
+                }
+            };
+            let master = match wrapped.unwrap_key(passphrase) {
+                Ok(k) => k,
+                Err(e) => {
+                    last_error = e;
+                    continue;
+                }
+            };
+            let bytes = match crypto::open(&master, &sealed_config, Aad::Config) {
+                Ok(b) => b,
+                Err(e) => {
+                    last_error = e;
+                    continue;
+                }
+            };
+            let config: RepoConfig = match serde_json::from_slice(&bytes) {
+                Ok(c) => c,
+                Err(source) => {
+                    last_error = Error::Malformed {
+                        what: "repository config".into(),
+                        source,
+                    };
+                    continue;
+                }
+            };
+            if config.version != FORMAT_VERSION {
+                return Err(Error::UnsupportedFormat {
+                    found: config.version,
+                    supported: FORMAT_VERSION,
+                });
+            }
+            opened = Some((config, master));
+            break;
         }
+        let (config, master_key) = opened.ok_or(last_error)?;
+
         let index = match backend.get(INDEX_PACK_KEY).await {
             Ok(raw) => serde_json::from_slice(&raw).map_err(|source| Error::Malformed {
                 what: "index pack".into(),
                 source,
             })?,
             // A missing or unreadable index is recoverable: it can be rebuilt
-            // from `blobs/` with [`Repository::rebuild_index`].
+            // from `blobs/` with [`Repository::rebuild_index`]. The index is
+            // not sensitive (hashes and keys only), so it stays unencrypted.
             Err(_) => IndexPack::default(),
         };
         Ok(Self {
             backend,
             config,
+            master_key,
             index: Mutex::new(index),
         })
     }
@@ -168,8 +249,12 @@ impl Repository {
     /// # Errors
     ///
     /// See [`Repository::init_with_backend`].
-    pub async fn init(path: impl AsRef<Path>, chunker: ChunkerConfig) -> Result<Self> {
-        Self::init_with_backend(Box::new(LocalBackend::new(path)), chunker).await
+    pub async fn init(
+        path: impl AsRef<Path>,
+        chunker: ChunkerConfig,
+        passphrase: &str,
+    ) -> Result<Self> {
+        Self::init_with_backend(Box::new(LocalBackend::new(path)), chunker, passphrase).await
     }
 
     /// Open an existing repository on the local filesystem.
@@ -177,8 +262,8 @@ impl Repository {
     /// # Errors
     ///
     /// See [`Repository::open_with_backend`].
-    pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
-        Self::open_with_backend(Box::new(LocalBackend::new(path))).await
+    pub async fn open(path: impl AsRef<Path>, passphrase: &str) -> Result<Self> {
+        Self::open_with_backend(Box::new(LocalBackend::new(path)), passphrase).await
     }
 
     /// This repository's configuration.
@@ -282,8 +367,14 @@ impl Repository {
         };
 
         let bytes = serde_json::to_vec_pretty(&snapshot).expect("Snapshot is serializable");
+        // Manifests contain source paths and hostnames: encrypt them like data.
+        let sealed = crypto::seal(
+            &self.master_key,
+            &bytes,
+            Aad::Blob(&format!("snapshot:{}", snapshot.id)),
+        )?;
         self.backend
-            .put(&snapshot_key(&snapshot.id), &bytes)
+            .put(&snapshot_key(&snapshot.id), &sealed)
             .await?;
         self.flush_index().await?;
         Ok(snapshot)
@@ -421,7 +512,8 @@ impl Repository {
     }
 
     /// Write one content-addressed blob unless it is already present, updating
-    /// stats and the in-memory index.
+    /// stats and the in-memory index. The stored bytes are sealed under the
+    /// master key with the blob's plaintext hash bound as AAD.
     ///
     /// Callers pass only blobs not already written this run (the chunking
     /// closure deduplicates `pending`; node hashes are deterministic), so no
@@ -435,9 +527,10 @@ impl Repository {
     ) -> Result<()> {
         let key = blob_key(hex);
         if !self.backend.exists(&key).await? {
-            self.backend.put(&key, bytes).await?;
+            let sealed = crypto::seal(&self.master_key, bytes, Aad::Blob(hex))?;
+            self.backend.put(&key, &sealed).await?;
             stats.new_chunks += 1;
-            stats.new_bytes += bytes.len() as u64;
+            stats.new_bytes += sealed.len() as u64;
         }
         self.index.lock().expect("index lock").record(IndexEntry {
             hash: hex.to_string(),
@@ -452,7 +545,7 @@ impl Repository {
         match r#ref {
             NodeRef::Inline(node) => Ok((**node).clone()),
             NodeRef::Blob(hex) => {
-                let bytes = self
+                let sealed = self
                     .backend
                     .get(&blob_key(hex))
                     .await
@@ -460,6 +553,8 @@ impl Repository {
                         Error::Io { .. } => Error::MissingBlob(hex.clone()),
                         other => other,
                     })?;
+                let bytes = crypto::open(&self.master_key, &sealed, Aad::Blob(hex))
+                    .map_err(|_| Error::MissingBlob(hex.clone()))?;
                 tree::parse_node(&bytes)
             }
         }
@@ -476,9 +571,20 @@ impl Repository {
             if !key.ends_with(".json") {
                 continue;
             }
-            let raw = self.backend.get(&key).await?;
+            let sealed = self.backend.get(&key).await?;
+            let bytes = crypto::open(
+                &self.master_key,
+                &sealed,
+                Aad::Blob(&format!(
+                    "snapshot:{}",
+                    key.rsplit('/')
+                        .next()
+                        .unwrap_or_default()
+                        .trim_end_matches(".json")
+                )),
+            )?;
             out.push(
-                serde_json::from_slice(&raw).map_err(|source| Error::Malformed {
+                serde_json::from_slice(&bytes).map_err(|source| Error::Malformed {
                     what: format!("snapshot manifest {key}"),
                     source,
                 })?,
@@ -526,10 +632,12 @@ impl Repository {
             .map_err(|e| Error::io(target, e))?;
 
         for (i, root_hex) in snapshot.roots.iter().enumerate() {
-            let bytes = self
+            let sealed = self
                 .backend
                 .get(&blob_key(root_hex))
                 .await
+                .map_err(|_| Error::MissingBlob(root_hex.clone()))?;
+            let bytes = crypto::open(&self.master_key, &sealed, Aad::Blob(root_hex))
                 .map_err(|_| Error::MissingBlob(root_hex.clone()))?;
             let node = tree::parse_node(&bytes)?;
 
@@ -580,10 +688,12 @@ impl Repository {
                     let file = std::fs::File::create(dest).map_err(|e| Error::io(dest, e))?;
                     let mut writer = std::io::BufWriter::new(file);
                     for hex in chunks {
-                        let bytes = self
+                        let sealed = self
                             .backend
                             .get(&blob_key(hex))
                             .await
+                            .map_err(|_| Error::MissingBlob(hex.clone()))?;
+                        let bytes = crypto::open(&self.master_key, &sealed, Aad::Blob(hex))
                             .map_err(|_| Error::MissingBlob(hex.clone()))?;
                         writer.write_all(&bytes).map_err(|e| Error::io(dest, e))?;
                     }

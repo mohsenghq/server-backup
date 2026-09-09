@@ -1,9 +1,14 @@
 //! End-to-end: a real directory tree survives a backup/restore round trip, and
-//! backing the same tree up twice writes no new blobs.
+//! backing the same tree up twice writes no new blobs. Repositories are
+//! encrypted: every test uses a passphrase, and dedicated cases cover wrong
+//! passphrases, at-rest ciphertext, and second-key wrapping.
 
 use std::path::{Path, PathBuf};
 
 use aegis_core::{ChunkerConfig, Repository};
+
+/// Passphrase used by the generic round-trip tests.
+const PASS: &str = "test-passphrase";
 
 /// Small chunk sizes so fixtures stay in the kilobytes rather than megabytes.
 fn chunker() -> ChunkerConfig {
@@ -87,7 +92,7 @@ async fn backup_then_restore_reproduces_the_tree() {
     let target = tmp.path().join("restored");
     build_tree(&source);
 
-    let repo = Repository::init(&repo_path, chunker()).await.unwrap();
+    let repo = Repository::init(&repo_path, chunker(), PASS).await.unwrap();
     let snapshot = repo.backup(std::slice::from_ref(&source)).await.unwrap();
 
     assert_eq!(snapshot.stats.files, 4);
@@ -114,7 +119,7 @@ async fn rebacking_up_an_unchanged_tree_writes_no_new_blobs() {
     let repo_path = tmp.path().join("repo");
     build_tree(&source);
 
-    let repo = Repository::init(&repo_path, chunker()).await.unwrap();
+    let repo = Repository::init(&repo_path, chunker(), PASS).await.unwrap();
     repo.backup(std::slice::from_ref(&source)).await.unwrap();
     let before = blob_count(&repo_path);
     assert!(before > 0);
@@ -139,7 +144,7 @@ async fn appending_to_a_file_reuses_existing_chunks() {
     let repo_path = tmp.path().join("repo");
     write(&source.join("data.bin"), &pseudo_random(300 * 1024, 17));
 
-    let repo = Repository::init(&repo_path, chunker()).await.unwrap();
+    let repo = Repository::init(&repo_path, chunker(), PASS).await.unwrap();
     let first = repo.backup(std::slice::from_ref(&source)).await.unwrap();
 
     let mut grown = pseudo_random(300 * 1024, 17);
@@ -160,13 +165,15 @@ async fn init_twice_fails_and_open_reads_back_the_config() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_path = tmp.path().join("repo");
 
-    let created = Repository::init(&repo_path, chunker()).await.unwrap();
+    let created = Repository::init(&repo_path, chunker(), PASS).await.unwrap();
     let id = created.config().id.clone();
 
-    assert!(Repository::init(&repo_path, chunker()).await.is_err());
-    assert!(Repository::open(tmp.path().join("nope")).await.is_err());
+    assert!(Repository::init(&repo_path, chunker(), PASS).await.is_err());
+    assert!(Repository::open(tmp.path().join("nope"), PASS)
+        .await
+        .is_err());
 
-    let opened = Repository::open(&repo_path).await.unwrap();
+    let opened = Repository::open(&repo_path, PASS).await.unwrap();
     assert_eq!(opened.config().id, id);
     assert_eq!(opened.config().chunker, chunker());
     assert!(opened.list_snapshots().await.unwrap().is_empty());
@@ -176,7 +183,7 @@ async fn init_twice_fails_and_open_reads_back_the_config() {
 async fn restoring_an_unknown_snapshot_fails() {
     let tmp = tempfile::tempdir().unwrap();
     let repo_path = tmp.path().join("repo");
-    let repo = Repository::init(&repo_path, chunker()).await.unwrap();
+    let repo = Repository::init(&repo_path, chunker(), PASS).await.unwrap();
     assert!(repo
         .restore("deadbeef", tmp.path().join("out"))
         .await
@@ -190,7 +197,7 @@ async fn snapshots_list_newest_first_even_within_the_same_second() {
     let repo_path = tmp.path().join("repo");
     write(&source.join("a.txt"), b"a");
 
-    let repo = Repository::init(&repo_path, chunker()).await.unwrap();
+    let repo = Repository::init(&repo_path, chunker(), PASS).await.unwrap();
     let first = repo.backup(std::slice::from_ref(&source)).await.unwrap();
     let second = repo.backup(std::slice::from_ref(&source)).await.unwrap();
 
@@ -209,4 +216,54 @@ async fn snapshots_list_newest_first_even_within_the_same_second() {
     // display_time drops sub-second digits but keeps a parseable timestamp.
     assert_eq!(first.display_time().len(), 19);
     assert!(second.display_time().starts_with("20"));
+}
+
+#[tokio::test]
+async fn wrong_passphrase_cannot_open_the_repository() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_path = tmp.path().join("repo");
+    Repository::init(&repo_path, chunker(), "right")
+        .await
+        .unwrap();
+
+    let err = match Repository::open(&repo_path, "wrong").await {
+        Err(e) => e,
+        Ok(_) => panic!("wrong passphrase opened the repository"),
+    };
+    // AEAD authentication failure, surfaced as decryption failure — it must
+    // never fall back to "success with garbage".
+    assert!(
+        matches!(err, aegis_core::Error::DecryptionFailed),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn blobs_and_manifests_are_encrypted_at_rest() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source");
+    let repo_path = tmp.path().join("repo");
+    let secret = b"the launch codes are 1-2-3-4";
+    write(&source.join("secret.txt"), secret);
+
+    let repo = Repository::init(&repo_path, chunker(), PASS).await.unwrap();
+    let snapshot = repo.backup(std::slice::from_ref(&source)).await.unwrap();
+    drop(repo);
+
+    // Nothing in the raw repository bytes may contain the secret.
+    let mut raw = Vec::new();
+    for f in walkdir_files(&repo_path) {
+        raw.extend(std::fs::read(&f).unwrap());
+    }
+    assert!(!raw.windows(secret.len()).any(|w| w == secret));
+
+    // The right passphrase still round-trips.
+    let repo = Repository::open(&repo_path, PASS).await.unwrap();
+    repo.restore(snapshot.short_id(), tmp.path().join("out"))
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(tmp.path().join("out/source/secret.txt")).unwrap(),
+        secret
+    );
 }

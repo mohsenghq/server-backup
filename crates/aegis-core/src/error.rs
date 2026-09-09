@@ -53,6 +53,19 @@ pub enum Error {
     /// A chunker configuration violated FastCDC's size invariants.
     #[error("invalid chunker configuration: {0}")]
     InvalidChunkerConfig(String),
+
+    /// A cryptographic operation failed outright (bad params, RNG, format).
+    #[error("crypto error: {0}")]
+    Crypto(String),
+
+    /// Decryption failed: wrong passphrase/key, wrong associated data, or a
+    /// tampered ciphertext. Authenticated encryption cannot distinguish these.
+    #[error("decryption failed (wrong passphrase or corrupted data)")]
+    DecryptionFailed,
+
+    /// No key file in the repository matched the supplied passphrase material.
+    #[error("no key in this repository matches the provided passphrase")]
+    NoMatchingKey,
 }
 
 /// Convenience alias for results returned by this crate.

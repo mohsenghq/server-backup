@@ -9,7 +9,7 @@
 //! # async fn example() -> aegis_core::Result<()> {
 //! use aegis_core::{ChunkerConfig, Repository};
 //!
-//! let repo = Repository::init("/srv/backups", ChunkerConfig::default()).await?;
+//! let repo = Repository::init("/srv/backups", ChunkerConfig::default(), "passphrase").await?;
 //! let snapshot = repo.backup(&["/etc".into()]).await?;
 //! repo.restore(&snapshot.id, "/tmp/restored").await?;
 //! # Ok(())
@@ -20,6 +20,7 @@
 
 pub mod backend;
 pub mod chunk;
+pub mod crypto;
 pub mod error;
 pub mod repo;
 pub mod snapshot;
@@ -27,6 +28,7 @@ pub mod tree;
 
 pub use backend::{Backend, LocalBackend};
 pub use chunk::{Chunk, ChunkHash, ChunkerConfig};
+pub use crypto::{KdfParams, Key, WrappedKey, KEY_LEN};
 pub use error::{Error, Result};
 pub use repo::{IndexEntry, IndexPack, RepoConfig, Repository, FORMAT_VERSION};
 pub use snapshot::{Snapshot, SnapshotStats};
