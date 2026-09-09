@@ -1,32 +1,13 @@
 //! Snapshot manifests: what a backup run recorded.
+//!
+//! Since the Phase 1 format work, a manifest no longer lists files directly —
+//! it stores one Merkle tree-root hash per source path
+//! (`docs/03-repository-format.md`). The full tree lives in content-addressed
+//! blobs; the manifest is the small, verifiable pointer to it.
 
 use serde::{Deserialize, Serialize};
 
-/// One backed-up file and the chunks its contents were split into.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileEntry {
-    /// Path relative to the snapshot root, always `/`-separated.
-    pub path: String,
-    /// Size of the file in bytes at backup time.
-    pub size: u64,
-    /// Unix permission bits, or `None` on platforms that do not report them.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mode: Option<u32>,
-    /// Modification time as a Unix timestamp in seconds, if available.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mtime: Option<i64>,
-    /// Hex BLAKE3 hashes of this file's chunks, in order. Concatenating the
-    /// referenced blobs reproduces the file byte for byte.
-    pub chunks: Vec<String>,
-}
-
 /// The manifest written to `snapshots/<id>.json` by a backup run.
-///
-// ponytail: Phase 0 stores a flat file list. `docs/03-repository-format.md`
-// specifies a Merkle tree of directory trees rooted in a single hash; that is
-// the Phase 1 "Full repository format" checklist item. A flat list restores
-// correctly and dedups blobs identically — it just cannot dedup *subtrees* or
-// verify structure by root hash.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     /// Unique snapshot identifier (also its filename stem).
@@ -37,8 +18,10 @@ pub struct Snapshot {
     pub hostname: String,
     /// The absolute source paths passed to `aegis backup`.
     pub paths: Vec<String>,
-    /// Every file captured by this snapshot.
-    pub files: Vec<FileEntry>,
+    /// Hex BLAKE3 hash of each source path's tree root, in the same order as
+    /// [`Snapshot::paths`]. Each root is the hash of a [`crate::tree::TreeNode`]
+    /// blob; re-deriving it from the stored blobs detects corruption.
+    pub roots: Vec<String>,
     /// Aggregate counters for this run.
     pub stats: SnapshotStats,
 }
@@ -50,9 +33,9 @@ pub struct SnapshotStats {
     pub files: u64,
     /// Total logical bytes read from the source.
     pub bytes: u64,
-    /// Chunks produced, including duplicates.
+    /// Chunks and tree blobs produced, including duplicates.
     pub chunks: u64,
-    /// Chunks that were not already in the repository and had to be written.
+    /// Blobs that were not already in the repository and had to be written.
     pub new_chunks: u64,
     /// Bytes actually written to the backend as new blobs.
     pub new_bytes: u64,

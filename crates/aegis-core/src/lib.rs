@@ -23,9 +23,11 @@ pub mod chunk;
 pub mod error;
 pub mod repo;
 pub mod snapshot;
+pub mod tree;
 
 pub use backend::{Backend, LocalBackend};
 pub use chunk::{Chunk, ChunkHash, ChunkerConfig};
 pub use error::{Error, Result};
-pub use repo::{RepoConfig, Repository, FORMAT_VERSION};
-pub use snapshot::{FileEntry, Snapshot, SnapshotStats};
+pub use repo::{IndexEntry, IndexPack, RepoConfig, Repository, FORMAT_VERSION};
+pub use snapshot::{Snapshot, SnapshotStats};
+pub use tree::{NodeRef, TreeEntry, TreeNode};

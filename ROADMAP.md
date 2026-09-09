@@ -13,7 +13,7 @@ Static plan — what "done" means for each phase. Work top to bottom, in order. 
 
 ## Phase 1 — Core Engine Complete
 
-- [ ] Full repository format: blobs / index / snapshot manifests (`docs/03-repository-format.md`)
+- [x] Full repository format: blobs / index / snapshot manifests (`docs/03-repository-format.md`)
 - [ ] Encryption (XChaCha20-Poly1305) + key derivation (Argon2id)
 - [ ] Compression (zstd, adaptive level)
 - [ ] Retention logic (GFS) + `aegis prune`

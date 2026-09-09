@@ -56,6 +56,19 @@ pub trait Backend: Send + Sync {
     ///
     /// Returns [`Error::Io`] if the object exists but cannot be removed.
     async fn delete(&self, key: &str) -> Result<()>;
+
+    /// Size in bytes of the object at `key`, if it exists and the backend can
+    /// report sizes cheaply. Used by the index rebuild; a `None` or `0` simply
+    /// records an unknown size.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Io`] if existence cannot be determined.
+    async fn size(&self, key: &str) -> Result<u64>;
+
+    /// Human-readable name of where this backend points (a directory, a host,
+    /// a bucket), for error messages.
+    fn location(&self) -> std::path::PathBuf;
 }
 
 /// A [`Backend`] backed by a directory on the local filesystem.
@@ -66,8 +79,10 @@ pub struct LocalBackend {
 
 impl LocalBackend {
     /// Create a backend rooted at `root`. The directory is created on first write.
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+    pub fn new(root: impl AsRef<Path>) -> Self {
+        Self {
+            root: root.as_ref().to_path_buf(),
+        }
     }
 
     /// The directory this backend writes into.
@@ -159,6 +174,18 @@ impl Backend for LocalBackend {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(Error::io(path, e)),
         }
+    }
+
+    async fn size(&self, key: &str) -> Result<u64> {
+        let path = self.resolve(key);
+        tokio::fs::metadata(&path)
+            .await
+            .map(|m| m.len())
+            .map_err(|e| Error::io(path, e))
+    }
+
+    fn location(&self) -> std::path::PathBuf {
+        self.root.clone()
     }
 }
 
