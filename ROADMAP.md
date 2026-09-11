@@ -15,12 +15,12 @@ Static plan — what "done" means for each phase. Work top to bottom, in order. 
 
 - [x] Full repository format: blobs / index / snapshot manifests (`docs/03-repository-format.md`)
 - [x] Encryption (XChaCha20-Poly1305) + key derivation (Argon2id)
-- [ ] Compression (zstd, adaptive level)
-- [ ] Retention logic (GFS) + `aegis prune`
-- [ ] `aegis verify` (integrity check)
-- [ ] SFTP/SSH backend (`russh` + `russh-sftp`)
-- [ ] Property-based tests (`proptest`) for chunker/dedup correctness under random mutation
-- [ ] `criterion` benchmark suite wired into CI
+- [x] Compression (zstd, adaptive level)
+- [x] Retention logic (GFS) + `aegis prune`
+- [x] `aegis verify` (integrity check)
+- [x] SFTP/SSH backend (`russh` + `russh-sftp`)
+- [x] Property-based tests (`proptest`) for chunker/dedup correctness under random mutation
+- [x] `criterion` benchmark suite wired into CI
 
 ## Phase 2 — Agentless Remote Backup
 
