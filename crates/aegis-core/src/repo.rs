@@ -795,8 +795,25 @@ impl Repository {
         // The synthetic root is a container, not a directory from the source
         // filesystem: its children — one per backed-up path — are laid
         // directly into `target`, so restoring recreates each backed-up
-        // directory by name, exactly as Phase 0 did.
-        match &snapshot.root {
+        // directory by name, exactly as Phase 0 did. A root whose
+        // serialization exceeded `INLINE_LIMIT` is stored as a ref blob; it
+        // must be fetched and unwrapped first, or the whole tree would be
+        // nested one level too deep under the ref's ("root") name.
+        let root_owned: Node;
+        let root: &Node = match &snapshot.root {
+            Node::Ref { hash, .. } => {
+                let stored = self.backend.get(&blob_key(hash)).await?;
+                let bytes = decode_blob_hash_ctx(self.crypto.as_ref(), hash, &stored)?;
+                root_owned = serde_json::from_slice(&bytes).map_err(|source| Error::Malformed {
+                    what: format!("tree node {hash}"),
+                    source,
+                })?;
+                root_owned.validate()?;
+                &root_owned
+            }
+            other => other,
+        };
+        match root {
             Node::Dir { children, .. } => {
                 for child in children {
                     restore_node(self.backend.as_ref(), self.crypto.as_ref(), child, target)
