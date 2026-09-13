@@ -124,6 +124,27 @@ impl russh::server::Handler for ConnHandler {
         Ok(())
     }
 
+    async fn exec_request(
+        &mut self,
+        channel: russh::ChannelId,
+        data: &[u8],
+        session: &mut russh::server::Session,
+    ) -> std::result::Result<(), Self::Error> {
+        // The in-process server has no shell; "run" the command by echoing
+        // it to stdout and exiting 0. Enough to exercise the exec message
+        // path end-to-end (request → stdout → exit-status → close).
+        session
+            .channel_success(channel)
+            .map_err(ServerError::from)?;
+        let _ = session.data(channel, data.to_vec());
+        session
+            .exit_status_request(channel, 0)
+            .map_err(ServerError::from)?;
+        session.eof(channel).map_err(ServerError::from)?;
+        session.close(channel).map_err(ServerError::from)?;
+        Ok(())
+    }
+
     async fn subsystem_request(
         &mut self,
         channel: russh::ChannelId,
@@ -440,6 +461,7 @@ impl russh_sftp::server::Handler for SftpFs {
 
 /// A convenience constructor used by the tests: an authenticated backend
 /// pointing at a freshly spawned in-process server.
+#[allow(dead_code)]
 pub async fn connected_backend(root: PathBuf) -> Result<(aegis_core::sftp::SftpBackend, u16)> {
     use aegis_core::sftp::{HostKeyPolicy, SftpAuth, SftpBackend, SftpTarget};
 

@@ -4,11 +4,20 @@ This file is the single source of truth for "where are we." Read it first, every
 
 ## Current phase
 
-**Phase 1 — Core Engine (complete pending CLI smoke test + push).** All eight checklist items in `ROADMAP.md` are implemented and tested.
+**Phase 1 — Core Engine (complete, pushed).** All eight checklist items in `ROADMAP.md` are implemented and tested.
+
+**Phase 2 — Agentless Remote Backup (in progress).** First checklist item, the SSH connection manager, is implemented and tested; the agentless remote-read backup mode is next.
 
 ## Current status
 
-The workspace builds, lints clean (`clippy -D warnings`, `fmt --check`), and 90 tests pass (51 unit + 22 backup/restore integration + 9 property + 5 SFTP + criterion bench + CLI). `aegis` is a complete Phase 1 core engine: Merkle-tree repository format, client-side encryption, zstd compression, GFS retention with prune, integrity verification, and an SFTP backend.
+The workspace builds, lints clean (`clippy -D warnings`, `fmt --check`), and 98 tests pass (54 unit + 22 backup/restore integration + 9 property + 5 SFTP + 5 SSH-manager + criterion bench + CLI). `aegis` is a complete Phase 1 core engine; Phase 2 has started with the SSH connection manager (`aegis-core::ssh`).
+
+New in Phase 2:
+
+- `aegis-core::ssh` — the SSH connection manager: `HostConfig` (user/host/port/auth/host-key policy with docs defaults), `SshManager` (per-host connection cache with automatic reconnect after a server-side drop), `exec`/`exec_check` (collects stdout/stderr/exit-status over the exec channel), `sftp_channel` (SFTP sessions multiplexed over the shared connection — the transport for agentless file reads), and `generate_host_keypair` (dedicated per-host ed25519 keypair per docs/04 key hardening) + `write_private_key`/`load_private_key` helpers.
+- The connect/auth logic is now shared: `sftp.rs` exposes `connect_handle` (crate-private) used by both the SFTP backend and the connection manager.
+- The in-process test SSH server (`tests/sftp_server.rs`) now answers `exec` requests (echo + exit 0), so exec paths are integration-tested without a real sshd; `tests/ssh_manager.rs` covers exec, exec_check, connection reuse across calls, explicit disconnect/reconnect, SFTP streaming over the shared connection, and clean auth-failure errors.
+- New workspace dependency: `getrandom = "0.3"` (ssh-key's `PrivateKey::random` needs rand_core 0.10, so the ed25519 keypair is generated from an OS-CSPRNG 32-byte seed via `Ed25519Keypair::from_seed`).
 
 What exists (Phase 0 items as before, plus all Phase 1 work):
 
@@ -32,12 +41,13 @@ This session also fixed a real bug found by the property suite on Windows: `rest
 
 ## Next action
 
-Push `main` to `origin` (the merge + fix commit are local only) and watch CI go green; then start **Phase 2 — Agentless Remote Backup** with the first checklist item: the SSH connection manager (`docs/04-host-connection-modes.md`, `docs/05-data-model.md`).
+Continue Phase 2: the agentless remote-read backup mode — stream remote files over the SSH manager's channels (SFTP reads or `tar`-style exec streaming), chunk/hash/compress/encrypt on the control-plane side, and store them through the existing repository (`docs/04`, `docs/11`).
 
 ## Session log
 
 _(newest first — append one short entry per work session; do not delete old entries)_
 
+- **2026-09-13** — Pushed the pending Phase 1 commits (CI now runs against the current tree) and started Phase 2: implemented the SSH connection manager in `aegis-core::ssh` (per-host connection cache, exec/exec_check, sftp_channel multiplexing, per-host ed25519 keypair generation), shared the connect/auth path with the SFTP backend, and taught the in-process test SSH server to answer exec. 98 tests + clippy `-D warnings` + fmt green; committed locally (push pending).
 - **2026-09-11** — Resolved the diverged-origin merge (origin carried older drafts of the same Phase 1 work; local HEAD was the superset, so all conflicts resolved with `--ours`) and completed the pull. Fixed the proptest-found restore bug for ref'd synthetic roots (tree > 4 KiB restored one level too deep). Full suite green: 90 tests, clippy `-D warnings`, fmt clean. Brought `PROGRESS.md`/`ROADMAP.md` back in sync with the code (they had drifted; Phase 1 items are all implemented). Merge + fix committed locally; push pending.
 - **2026-09-09 (2)** — Phase 1 encryption complete. Added `crypto.rs` (Argon2id KDF, XChaCha20-Poly1305 seal/open with AAD role binding, master-key wrapping into `keys/<keyid>.json`); wired sealing into every blob, snapshot manifest, and the repo config; CLI gained `--passphrase-file` / `AEGIS_PASSPHRASE` on all repo commands. New tests bring the suite to 32; clippy/fmt green. CLI smoke test confirmed: no plaintext at rest, wrong passphrase rejected cleanly. Also pushed the previous session's repository-format work to `origin/main` (first CI run now triggered).
 - **2026-09-09** — Phase 1 repository format complete. Replaced the flat snapshot manifest with a Merkle tree (`tree.rs`: Dir/File nodes, inline-vs-blob children, one root hash per source path); added the packed `index/pack.json` with flush and rebuild-from-blobs; made `Repository` backend-generic (`init_with_backend`/`open_with_backend`); made restore stream chunks (bounded memory) and verify restored sizes; bumped format version to 2. Fixed a run-local dedup bug that suppressed chunk writes (caught by the CLI smoke test, then covered by the existing integration tests). 22 tests + clippy `-D warnings` + fmt green; CLI smoke-tested backup→backup→restore with `diff -r` clean.
@@ -58,6 +68,7 @@ _(record any substitution of a library/approach from what the docs specify, with
 _(anything that needs a second look, or a question for the user before proceeding)_
 
 - **The merge, restore fix, and PROGRESS/ROADMAP updates are committed locally but not pushed**; CI has therefore still not run against the current tree (see next action).
+- **The Phase 2 SSH-manager work is committed locally but not pushed.**
 - **No mtime/size fast-path.** Every backup re-reads and re-hashes every file. Dedup means an unchanged tree writes nothing, but it does not yet approach "the speed of a metadata-only walk" as `docs/11-performance-targets.md` requires. The fast-path is described in `docs/03-repository-format.md`.
 - **`restore` verifies by size only, not by re-hashing**; `aegis verify --deep` is the full-hash path.
 - **Symlinks, hardlinks, empty directories, and non-regular files are skipped** by `backup`. Only regular files are captured. Needs a decision in Phase 1→2 transition on how to represent them in the tree format.

@@ -29,6 +29,7 @@ pub mod repo;
 pub mod retention;
 pub mod sftp;
 pub mod snapshot;
+pub mod ssh;
 pub mod tree;
 
 pub use backend::{Backend, LocalBackend};
@@ -36,7 +37,9 @@ pub use chunk::{Chunk, ChunkHash, ChunkerConfig};
 pub use error::{Error, Result};
 pub use keys::{AeadContext, KeyFile, PassphraseSource, RepoCrypto};
 pub use repo::{RepoConfig, Repository, FORMAT_VERSION};
+pub use sftp::{parse_location, RepoLocation, SftpAuth};
 pub use snapshot::{BlobKind, BlobRef, Snapshot, SnapshotIndex, SnapshotStats};
+pub use ssh::{ExecOutput, HostConfig, SshManager};
 pub use tree::{Node, INLINE_LIMIT};
 
 /// Stable key-layout helpers exposed for integration tests and inspection

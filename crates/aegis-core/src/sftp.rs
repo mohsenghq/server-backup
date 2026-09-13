@@ -202,6 +202,67 @@ impl std::fmt::Debug for SftpBackend {
     }
 }
 
+/// Connect to `user@host:port`, authenticate with `auth`, and return the
+/// live SSH handle. Shared by the SFTP backend and the Phase 2 SSH
+/// connection manager.
+pub(crate) async fn connect_handle(
+    user: &str,
+    host: &str,
+    port: u16,
+    auth: &SftpAuth,
+    policy: &HostKeyPolicy,
+) -> Result<client::Handle<ClientHandler>> {
+    let config = Arc::new(client::Config {
+        inactivity_timeout: Some(std::time::Duration::from_secs(600)),
+        keepalive_interval: Some(std::time::Duration::from_secs(30)),
+        ..client::Config::default()
+    });
+
+    let mut handle = russh::client::connect(
+        config,
+        (host, port),
+        ClientHandler {
+            policy: policy.clone(),
+            host: host.to_string(),
+            port,
+        },
+    )
+    .await
+    .map_err(|e| Error::Ssh(format!("connecting to {host}:{port}: {e}")))?;
+
+    let auth_result = match auth {
+        SftpAuth::Password(password) => handle
+            .authenticate_password(user, password.clone())
+            .await
+            .map_err(|e| Error::Ssh(format!("authentication exchange failed: {e}")))?,
+        SftpAuth::KeyFile {
+            path,
+            key_passphrase,
+        } => {
+            let key = russh::keys::load_secret_key(path, key_passphrase.as_deref())
+                .map_err(|e| Error::Ssh(format!("loading key {}: {e}", path.display())))?;
+            let key = PrivateKeyWithHashAlg::new(Arc::new(key), Some(HashAlg::Sha256));
+            handle
+                .authenticate_publickey(user, key)
+                .await
+                .map_err(|e| Error::Ssh(format!("authentication exchange failed: {e}")))?
+        }
+        SftpAuth::Key(key) => {
+            let key = PrivateKeyWithHashAlg::new(Arc::clone(key), Some(HashAlg::Sha256));
+            handle
+                .authenticate_publickey(user, key)
+                .await
+                .map_err(|e| Error::Ssh(format!("authentication exchange failed: {e}")))?
+        }
+    };
+    if !auth_result.success() {
+        return Err(Error::Ssh(format!(
+            "authentication failed for user `{user}` on {host}"
+        )));
+    }
+    Ok(handle)
+}
+
 impl SftpBackend {
     /// Prepare a backend for `sftp://user@host:port/path`.
     pub fn new(target: SftpTarget, auth: SftpAuth) -> Self {
@@ -225,61 +286,14 @@ impl SftpBackend {
     }
 
     async fn connect_and_auth(&self) -> Result<Arc<SftpSession>> {
-        let config = Arc::new(client::Config {
-            inactivity_timeout: Some(std::time::Duration::from_secs(600)),
-            keepalive_interval: Some(std::time::Duration::from_secs(30)),
-            ..client::Config::default()
-        });
-
-        let addr = (self.target.host.as_str(), self.target.port);
-        let mut handle = russh::client::connect(
-            config,
-            addr,
-            ClientHandler {
-                policy: self.host_key_policy.clone(),
-                host: self.target.host.clone(),
-                port: self.target.port,
-            },
+        let handle = connect_handle(
+            &self.target.user,
+            &self.target.host,
+            self.target.port,
+            &self.auth,
+            &self.host_key_policy,
         )
-        .await
-        .map_err(|e| {
-            Error::Ssh(format!(
-                "connecting to {}:{}: {e}",
-                self.target.host, self.target.port
-            ))
-        })?;
-
-        let auth_result = match &self.auth {
-            SftpAuth::Password(password) => handle
-                .authenticate_password(&self.target.user, password.clone())
-                .await
-                .map_err(|e| Error::Ssh(format!("authentication exchange failed: {e}")))?,
-            SftpAuth::KeyFile {
-                path,
-                key_passphrase,
-            } => {
-                let key = russh::keys::load_secret_key(path, key_passphrase.as_deref())
-                    .map_err(|e| Error::Ssh(format!("loading key {}: {e}", path.display())))?;
-                let key = PrivateKeyWithHashAlg::new(Arc::new(key), Some(HashAlg::Sha256));
-                handle
-                    .authenticate_publickey(&self.target.user, key)
-                    .await
-                    .map_err(|e| Error::Ssh(format!("authentication exchange failed: {e}")))?
-            }
-            SftpAuth::Key(key) => {
-                let key = PrivateKeyWithHashAlg::new(Arc::clone(key), Some(HashAlg::Sha256));
-                handle
-                    .authenticate_publickey(&self.target.user, key)
-                    .await
-                    .map_err(|e| Error::Ssh(format!("authentication exchange failed: {e}")))?
-            }
-        };
-        if !auth_result.success() {
-            return Err(Error::Ssh(format!(
-                "authentication failed for user `{}` on {}",
-                self.target.user, self.target.host
-            )));
-        }
+        .await?;
 
         let channel = handle
             .channel_open_session()
@@ -463,14 +477,15 @@ impl Backend for SftpBackend {
 }
 
 /// `russh` client callbacks: host-key verification only.
-struct ClientHandler {
+pub struct ClientHandler {
     policy: HostKeyPolicy,
     host: String,
     port: u16,
 }
 
 #[derive(Debug)]
-struct SshProtoError(Error);
+/// Adapter type in the public `client::Handler` signature; opaque.
+pub struct SshProtoError(Error);
 
 impl std::fmt::Display for SshProtoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
