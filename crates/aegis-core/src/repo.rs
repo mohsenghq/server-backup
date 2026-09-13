@@ -298,6 +298,95 @@ impl Repository {
         self.backend.as_ref()
     }
 
+    /// Store one content-addressed chunk if the repository does not have it
+    /// already (`seen` dedups within a run). Returns `true` when a new blob
+    /// was written. Used by both the local and the agentless backup paths.
+    ///
+    /// # Errors
+    ///
+    /// Backend failures propagate.
+    pub(crate) async fn store_chunk(
+        &self,
+        hex: &str,
+        bytes: &[u8],
+        seen: &mut HashSet<String>,
+        stats: &mut SnapshotStats,
+        written: &mut HashMap<String, u64>,
+    ) -> Result<bool> {
+        if !seen.insert(hex.to_string()) {
+            return Ok(false);
+        }
+        if self.backend.exists(&blob_key(hex)).await? {
+            return Ok(false);
+        }
+        let stored = self.seal_for(&blob_key(hex), &AeadContext::Hash(hex), bytes)?;
+        self.backend.put(&blob_key(hex), &stored).await?;
+        stats.new_chunks += 1;
+        stats.new_bytes += stored.len() as u64;
+        written.insert(hex.to_string(), stored.len() as u64);
+        Ok(true)
+    }
+
+    /// Commit a fully-built tree as a new snapshot: store ref'd node blobs,
+    /// then the index and the manifest. Shared by the local and agentless
+    /// backup paths.
+    ///
+    /// # Errors
+    ///
+    /// Backend failures propagate.
+    pub(crate) async fn commit_snapshot(
+        &self,
+        mut root: Node,
+        paths: Vec<String>,
+        mut stats: SnapshotStats,
+        written: &mut HashMap<String, u64>,
+    ) -> Result<Snapshot> {
+        root.sort();
+        let (root, node_blobs) = tree::build_stored(root)?;
+
+        for (hash, bytes) in &node_blobs {
+            if !self.backend.exists(&blob_key(hash)).await? {
+                let stored = self.seal_for(&blob_key(hash), &AeadContext::Hash(hash), bytes)?;
+                self.backend.put(&blob_key(hash), &stored).await?;
+                stats.new_tree_nodes += 1;
+                written.insert(hash.clone(), stored.len() as u64);
+            }
+        }
+
+        let snapshot = Snapshot {
+            id: uuid::Uuid::new_v4().simple().to_string(),
+            time: time::OffsetDateTime::now_utc()
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("RFC 3339 formatting of a valid timestamp"),
+            hostname: hostname::get()
+                .map(|h| h.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "unknown".into()),
+            paths,
+            root,
+            stats,
+        };
+
+        let index = self.build_index(&snapshot, written);
+        let index_plain = serde_json::to_vec(&index).expect("SnapshotIndex is serializable");
+        let index_bytes =
+            self.seal_for(&index_key(&snapshot.id), &AeadContext::Doc, &index_plain)?;
+        self.backend
+            .put(&index_key(&snapshot.id), &index_bytes)
+            .await?;
+
+        let manifest_plain =
+            serde_json::to_vec_pretty(&snapshot).expect("Snapshot is serializable");
+        let manifest_bytes = self.seal_for(
+            &snapshot_key(&snapshot.id),
+            &AeadContext::Doc,
+            &manifest_plain,
+        )?;
+        self.backend
+            .put(&snapshot_key(&snapshot.id), &manifest_bytes)
+            .await?;
+        Ok(snapshot)
+    }
+
     /// Back up every regular file under `paths`, writing a new snapshot.
     ///
     /// Symlinks are not followed and are skipped this phase. Unreadable files

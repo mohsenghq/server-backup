@@ -154,6 +154,50 @@ where
     Ok(())
 }
 
+/// Split an [`tokio::io::AsyncRead`] stream into content-defined chunks,
+/// invoking `sink` with each chunk and its bytes as they are produced.
+///
+/// The async twin of [`chunk_stream`]: same boundaries, same hashes, same
+/// bounded-memory guarantees, but the source can be a network stream (the
+/// SFTP file handle of an agentless backup).
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidChunkerConfig`] for a bad `config`, [`Error::Io`] if
+/// `reader` fails, or whatever error `sink` returns.
+pub async fn chunk_async_stream<R, F>(
+    mut reader: R,
+    config: &ChunkerConfig,
+    mut sink: F,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    F: FnMut(&Chunk, &[u8]) -> Result<()>,
+{
+    config.validate()?;
+    let mut chunker = fastcdc::v2020::AsyncStreamCDC::new(
+        &mut reader,
+        config.min_size,
+        config.avg_size,
+        config.max_size,
+    );
+    use tokio_stream::StreamExt;
+    let mut stream = std::pin::pin!(chunker.as_stream());
+    while let Some(item) = stream.next().await {
+        let c = item.map_err(|e| match e {
+            fastcdc::v2020::Error::IoError(source) => Error::io("<stream>", source),
+            other => Error::io("<stream>", std::io::Error::other(other.to_string())),
+        })?;
+        let chunk = Chunk {
+            hash: blake3::hash(&c.data),
+            offset: c.offset,
+            length: c.length,
+        };
+        sink(&chunk, &c.data)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

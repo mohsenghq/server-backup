@@ -19,6 +19,7 @@
 
 #![warn(missing_docs)]
 
+pub mod agentless;
 pub mod backend;
 pub mod blobs;
 pub mod chunk;
@@ -32,6 +33,7 @@ pub mod snapshot;
 pub mod ssh;
 pub mod tree;
 
+pub use agentless::backup_remote;
 pub use backend::{Backend, LocalBackend};
 pub use chunk::{Chunk, ChunkHash, ChunkerConfig};
 pub use error::{Error, Result};

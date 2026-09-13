@@ -29,7 +29,7 @@ base64 = "0.22"
 blake3 = "1"
 chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive"] }
-fastcdc = "5"
+fastcdc = { version = "5", features = ["tokio"] }
 filetime = "0.2"
 getrandom = "0.3"
 hostname = "0.4"
@@ -41,6 +41,7 @@ serde_json = "1"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing", "serde-well-known"] }
 tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread"] }
+tokio-stream = "0.1"
 uuid = { version = "1", features = ["v4"] }
 walkdir = "2"
 zstd = "0.13"

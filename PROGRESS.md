@@ -6,7 +6,7 @@ This file is the single source of truth for "where are we." Read it first, every
 
 **Phase 1 — Core Engine (complete, pushed).** All eight checklist items in `ROADMAP.md` are implemented and tested.
 
-**Phase 2 — Agentless Remote Backup (in progress).** First checklist item, the SSH connection manager, is implemented and tested; the agentless remote-read backup mode is next.
+**Phase 2 — Agentless Remote Backup (in progress).** The SSH connection manager and the agentless remote-read backup mode are implemented and tested; next up is the host inventory + SQLite catalog.
 
 ## Current status
 
@@ -18,6 +18,8 @@ New in Phase 2:
 - The connect/auth logic is now shared: `sftp.rs` exposes `connect_handle` (crate-private) used by both the SFTP backend and the connection manager.
 - The in-process test SSH server (`tests/sftp_server.rs`) now answers `exec` requests (echo + exit 0), so exec paths are integration-tested without a real sshd; `tests/ssh_manager.rs` covers exec, exec_check, connection reuse across calls, explicit disconnect/reconnect, SFTP streaming over the shared connection, and clean auth-failure errors.
 - New workspace dependency: `getrandom = "0.3"` (ssh-key's `PrivateKey::random` needs rand_core 0.10, so the ed25519 keypair is generated from an OS-CSPRNG 32-byte seed via `Ed25519Keypair::from_seed`).
+- `aegis-core::agentless` — the agentless remote-read backup: `backup_remote(repo, ssh, host, chunker, &[/abs/paths])` walks remote trees over the SFTP channel, streams every file through the new async chunker (`chunk_async_stream`, the tokio twin of `chunk_stream` — same boundaries, same hashes), dedups against the repository, and commits a snapshot byte-identical in format to a local one. Symlinks/non-regular remote entries are skipped, mirroring the local path. `Repository::store_chunk` and `Repository::commit_snapshot` were factored out of `backup` so both paths share the blob/index/manifest logic.
+- Integration tests (`tests/agentless.rs`) run against the in-process SFTP server: backup→deep-verify→byte-identical restore, the dedup property (a second unchanged run writes zero new chunks/nodes), and rejection of relative remote paths. `fastcdc` now enables its `tokio` feature (+ `tokio-stream` for stream iteration).
 
 What exists (Phase 0 items as before, plus all Phase 1 work):
 
@@ -41,12 +43,13 @@ This session also fixed a real bug found by the property suite on Windows: `rest
 
 ## Next action
 
-Continue Phase 2: the agentless remote-read backup mode — stream remote files over the SSH manager's channels (SFTP reads or `tar`-style exec streaming), chunk/hash/compress/encrypt on the control-plane side, and store them through the existing repository (`docs/04`, `docs/11`).
+Continue Phase 2: the host inventory + SQLite catalog (`docs/05-data-model.md`) — the `hosts` table plus CRUD, with SSH keys stored envelope-encrypted.
 
 ## Session log
 
 _(newest first — append one short entry per work session; do not delete old entries)_
 
+- **2026-09-13 (2)** — Agentless remote-read backup complete: `aegis-core::agentless::backup_remote` streams remote files over the SSH manager's SFTP channel through a new async chunker, dedups, and commits snapshots identical in format to local ones. Refactored `Repository::backup` to share `store_chunk`/`commit_snapshot` with the new path. 101 tests + clippy `-D warnings` + fmt green; committed locally (push pending).
 - **2026-09-13** — Pushed the pending Phase 1 commits (CI now runs against the current tree) and started Phase 2: implemented the SSH connection manager in `aegis-core::ssh` (per-host connection cache, exec/exec_check, sftp_channel multiplexing, per-host ed25519 keypair generation), shared the connect/auth path with the SFTP backend, and taught the in-process test SSH server to answer exec. 98 tests + clippy `-D warnings` + fmt green; committed locally (push pending).
 - **2026-09-11** — Resolved the diverged-origin merge (origin carried older drafts of the same Phase 1 work; local HEAD was the superset, so all conflicts resolved with `--ours`) and completed the pull. Fixed the proptest-found restore bug for ref'd synthetic roots (tree > 4 KiB restored one level too deep). Full suite green: 90 tests, clippy `-D warnings`, fmt clean. Brought `PROGRESS.md`/`ROADMAP.md` back in sync with the code (they had drifted; Phase 1 items are all implemented). Merge + fix committed locally; push pending.
 - **2026-09-09 (2)** — Phase 1 encryption complete. Added `crypto.rs` (Argon2id KDF, XChaCha20-Poly1305 seal/open with AAD role binding, master-key wrapping into `keys/<keyid>.json`); wired sealing into every blob, snapshot manifest, and the repo config; CLI gained `--passphrase-file` / `AEGIS_PASSPHRASE` on all repo commands. New tests bring the suite to 32; clippy/fmt green. CLI smoke test confirmed: no plaintext at rest, wrong passphrase rejected cleanly. Also pushed the previous session's repository-format work to `origin/main` (first CI run now triggered).
@@ -68,7 +71,7 @@ _(record any substitution of a library/approach from what the docs specify, with
 _(anything that needs a second look, or a question for the user before proceeding)_
 
 - **The merge, restore fix, and PROGRESS/ROADMAP updates are committed locally but not pushed**; CI has therefore still not run against the current tree (see next action).
-- **The Phase 2 SSH-manager work is committed locally but not pushed.**
+- **The Phase 2 work (SSH manager + agentless backup) is committed locally but not pushed.**
 - **No mtime/size fast-path.** Every backup re-reads and re-hashes every file. Dedup means an unchanged tree writes nothing, but it does not yet approach "the speed of a metadata-only walk" as `docs/11-performance-targets.md` requires. The fast-path is described in `docs/03-repository-format.md`.
 - **`restore` verifies by size only, not by re-hashing**; `aegis verify --deep` is the full-hash path.
 - **Symlinks, hardlinks, empty directories, and non-regular files are skipped** by `backup`. Only regular files are captured. Needs a decision in Phase 1→2 transition on how to represent them in the tree format.
