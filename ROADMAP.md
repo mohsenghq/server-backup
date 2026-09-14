@@ -32,7 +32,7 @@ Static plan — what "done" means for each phase. Work top to bottom, in order. 
 
 ## Phase 3 — Server, API, Scheduling
 
-- [ ] `aegis-server` skeleton (`axum`)
+- [x] `aegis-server` skeleton (`axum`)
 - [ ] Auth: local users, Argon2 password hashing, sessions
 - [ ] Scheduler (`tokio-cron-scheduler`) driving policies
 - [ ] Job queue + worker pool
