@@ -55,3 +55,18 @@ jobs:
       - run: cargo bench --workspace --no-run
       - name: Smoke-run benchmarks (reduced sampling)
         run: cargo bench -p aegis-core --bench bench -- --warm-up-time 0.2 --measurement-time 0.8
+
+  # Phase 2: the agentless path against a REAL sshd (the in-process russh
+  # server covers hermetic runs; this job validates against stock OpenSSH).
+  docker-tests:
+    name: real sshd (docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: docker-tests
+      - run: cargo test -p aegis-core --test real_sshd
+        env:
+          AEGIS_DOCKER_TESTS: "1"

@@ -1,0 +1,17 @@
+# Local harness for the real-sshd integration tests.
+# CI starts its own container; this file is for developer machines:
+#   docker compose -f docker-compose.sshd.yml up -d
+#   AEGIS_DOCKER_TESTS=1 cargo test -p aegis-core --test real_sshd
+# The tests manage the container themselves when compose isn't used.
+services:
+  sshd:
+    image: linuxserver/openssh-server:latest
+    container_name: aegis-it-sshd
+    ports:
+      - "2222:2222"
+    environment:
+      - PASSWORD_ACCESS=aegis-test-password
+      - USER_NAME=aegis
+      - USER_PASSWORD_ACCESS=true
+    volumes:
+      - ./it-data:/data

@@ -6,11 +6,11 @@ This file is the single source of truth for "where are we." Read it first, every
 
 **Phase 1 — Core Engine (complete, pushed).** All eight checklist items in `ROADMAP.md` are implemented and tested.
 
-**Phase 2 — Agentless Remote Backup (in progress).** The SSH connection manager, the agentless remote-read backup mode, the host inventory + SQLite catalog, and the multi-host CLI orchestration (`aegis host add/list/remove/backup-all`) are implemented and tested; the last Phase 2 item is integration tests against a real SSH target (container).
+**Phase 2 — Agentless Remote Backup (complete).** All five roadmap items are implemented and tested: the SSH connection manager, the agentless remote-read backup mode, the host inventory + SQLite catalog, the multi-host CLI orchestration (`aegis host add/list/remove/backup-all`), and containerized integration tests against a real sshd. Next phase: Phase 3 — Server, API, Scheduling.
 
 ## Current status
 
-The workspace builds, lints clean (`clippy -D warnings`, `fmt --check`), and 107 tests pass (59 unit + 22 backup/restore integration + 9 property + 5 SFTP + 5 SSH-manager + 3 agentless + 1 host-inventory + criterion bench + CLI). `aegis` is a complete Phase 1 core engine; Phase 2 has started with the SSH connection manager (`aegis-core::ssh`).
+The workspace builds, lints clean (`clippy -D warnings`, `fmt --check`), and 108 tests pass (59 unit + 22 backup/restore integration + 9 property + 5 SFTP + 5 SSH-manager + 3 agentless + 1 host-inventory + 1 real-sshd + criterion bench + CLI). `aegis` is a complete Phase 1 core engine; Phase 2 has started with the SSH connection manager (`aegis-core::ssh`).
 
 New in Phase 2:
 
@@ -45,12 +45,13 @@ This session also fixed a real bug found by the property suite on Windows: `rest
 
 ## Next action
 
-Finish Phase 2: integration tests against a real SSH target (container), per the roadmap.
+Start Phase 3: `aegis-server` skeleton (axum) — health endpoint, host CRUD + `host backup-all` endpoints over the catalog, auth scaffolding.
 
 ## Session log
 
 _(newest first — append one short entry per work session; do not delete old entries)_
 
+- **2026-09-14 (3)** — Final Phase 2 item: `tests/real_sshd.rs`, containerized integration tests against stock OpenSSH (`linuxserver/openssh-server`) gated behind `AEGIS_DOCKER_TESTS=1` with a daemon probe so they skip cleanly without Docker; CI gained a `docker-tests` job on ubuntu and `docker-compose.sshd.yml` gives developers the same harness. 108 tests + clippy + fmt green. Committed (push pending).
 - **2026-09-14 (2)** — Multi-host CLI orchestration: `aegis host add/list/remove/backup-all` wired to the catalog and the agentless backup; catalog master key wrapped into a sidecar key file; `--generate-key` prints the public key for `authorized_keys`. 107 tests + clippy `-D warnings` + fmt green; CLI smoke-tested end-to-end (add → list → remove). Committed (push pending).
 - **2026-09-14** — Host inventory + SQLite catalog: `aegis-core::catalog` with the full docs/05 schema, host CRUD, audit log, and SSH keys envelope-encrypted under a new `AeadContext::Host` AAD binding. 106 tests + clippy `-D warnings` + fmt green; committed (push pending).
 - **2026-09-13 (2)** — Agentless remote-read backup complete: `aegis-core::agentless::backup_remote` streams remote files over the SSH manager's SFTP channel through a new async chunker, dedups, and commits snapshots identical in format to local ones. Refactored `Repository::backup` to share `store_chunk`/`commit_snapshot` with the new path. 101 tests + clippy `-D warnings` + fmt green; committed locally (push pending).
@@ -75,7 +76,7 @@ _(record any substitution of a library/approach from what the docs specify, with
 _(anything that needs a second look, or a question for the user before proceeding)_
 
 - **The merge, restore fix, and PROGRESS/ROADMAP updates are committed locally but not pushed**; CI has therefore still not run against the current tree (see next action).
-- **The catalog work and the host CLI are committed locally but not pushed.**
+- **The real-sshd integration tests have only been run locally with the Docker daemon unavailable (they skip); the CI `docker-tests` job is their first real execution — watch its first run.**
 - **No mtime/size fast-path.** Every backup re-reads and re-hashes every file. Dedup means an unchanged tree writes nothing, but it does not yet approach "the speed of a metadata-only walk" as `docs/11-performance-targets.md` requires. The fast-path is described in `docs/03-repository-format.md`.
 - **`restore` verifies by size only, not by re-hashing**; `aegis verify --deep` is the full-hash path.
 - **Symlinks, hardlinks, empty directories, and non-regular files are skipped** by `backup`. Only regular files are captured. Needs a decision in Phase 1→2 transition on how to represent them in the tree format.

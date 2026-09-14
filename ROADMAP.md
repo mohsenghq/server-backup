@@ -28,7 +28,7 @@ Static plan — what "done" means for each phase. Work top to bottom, in order. 
 - [x] Agentless remote-read backup mode (chunk/hash on the control-plane side)
 - [x] Host inventory + SQLite catalog
 - [x] Capacity-aware multi-host CLI orchestration: `aegis host add`, `aegis host backup-all`
-- [ ] Integration tests against a real SSH target (container)
+- [x] Integration tests against a real SSH target (container)
 
 ## Phase 3 — Server, API, Scheduling
 
