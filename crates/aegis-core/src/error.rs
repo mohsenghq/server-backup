@@ -104,6 +104,10 @@ pub enum Error {
     #[error("ssh error: {0}")]
     Ssh(String),
 
+    /// A catalog (SQLite) operation failed.
+    #[error("catalog error: {0}")]
+    Catalog(String),
+
     /// The server's host key changed since it was first recorded.
     ///
     /// This is the classic machine-in-the-middle signal; the session is

@@ -1,0 +1,624 @@
+//! The catalog: a SQLite database recording hosts, policies, jobs, snapshots,
+//! users, and the audit log (`docs/05-data-model.md`).
+//!
+//! SSH private keys are never stored in the clear: they are sealed with the
+//! same XChaCha20-Poly1305 AEAD used for repository data, bound to the
+//! `aegis:host:<id>` role, so a stolen catalog file yields no credentials
+//! without the control-plane key.
+//!
+//! Queries are runtime-checked `sqlx` (no compile-time macros), keeping the
+//! build independent of a live database; the same statements run against
+//! Postgres by swapping the pool (a Phase 3 concern).
+
+use std::path::Path;
+use std::str::FromStr;
+
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqliteRow},
+    Row,
+};
+
+use crate::crypto::{self, KEY_LEN, NONCE_LEN};
+use crate::error::{Error, Result};
+use crate::keys::AeadContext;
+
+/// How a host is backed up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupMode {
+    /// No agent; the control plane reads files over SSH (default).
+    Agentless,
+    /// The `aegis-agent` runs on the target and pushes.
+    Agent,
+}
+
+impl BackupMode {
+    /// The string stored in the catalog's `mode` column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackupMode::Agentless => "agentless",
+            BackupMode::Agent => "agent",
+        }
+    }
+}
+
+impl FromStr for BackupMode {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "agentless" => Ok(BackupMode::Agentless),
+            "agent" => Ok(BackupMode::Agent),
+            other => Err(Error::Catalog(format!("unknown backup mode `{other}`"))),
+        }
+    }
+}
+
+/// Reachability of a host as last observed by the scheduler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostStatus {
+    /// Never probed (the state right after registration).
+    Unknown,
+    /// Last connection attempt succeeded.
+    Reachable,
+    /// Last connection attempt failed.
+    Unreachable,
+}
+
+impl HostStatus {
+    /// The string stored in the catalog's `status` column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HostStatus::Unknown => "unknown",
+            HostStatus::Reachable => "reachable",
+            HostStatus::Unreachable => "unreachable",
+        }
+    }
+}
+
+impl FromStr for HostStatus {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "unknown" => Ok(HostStatus::Unknown),
+            "reachable" => Ok(HostStatus::Reachable),
+            "unreachable" => Ok(HostStatus::Unreachable),
+            other => Err(Error::Catalog(format!("unknown host status `{other}`"))),
+        }
+    }
+}
+
+/// A registered backup target.
+#[derive(Debug, Clone)]
+pub struct Host {
+    /// Stable identifier (UUID v4).
+    pub id: String,
+    /// Human-friendly display name.
+    pub name: String,
+    /// Hostname or IP the control plane connects to.
+    pub address: String,
+    /// SSH port (default 22).
+    pub ssh_port: u16,
+    /// SSH login user.
+    pub ssh_user: String,
+    /// How this host is backed up.
+    pub mode: BackupMode,
+    /// Reachability as last observed.
+    pub status: HostStatus,
+    /// Seconds since the Unix epoch when the host was registered.
+    pub created_at: i64,
+}
+
+/// A host together with its decrypted SSH private key (PEM). Transient — the
+/// key material never persists outside the process.
+#[derive(Debug)]
+pub struct HostWithKey {
+    /// The host record.
+    pub host: Host,
+    /// PEM-encoded private key, decrypted on read.
+    pub ssh_key_pem: Vec<u8>,
+}
+
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS hosts (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  address TEXT NOT NULL,
+  ssh_port INTEGER NOT NULL DEFAULT 22,
+  ssh_user TEXT NOT NULL,
+  ssh_key_encrypted BLOB NOT NULL,
+  mode TEXT NOT NULL DEFAULT 'agentless',
+  status TEXT NOT NULL DEFAULT 'unknown',
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS policies (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  schedule_cron TEXT NOT NULL,
+  retention_json TEXT NOT NULL,
+  paths_json TEXT NOT NULL,
+  exclude_json TEXT NOT NULL,
+  bandwidth_limit_kbps INTEGER,
+  pre_hook TEXT,
+  post_hook TEXT
+);
+
+CREATE TABLE IF NOT EXISTS host_policies (
+  host_id TEXT REFERENCES hosts(id),
+  policy_id TEXT REFERENCES policies(id),
+  PRIMARY KEY (host_id, policy_id)
+);
+
+CREATE TABLE IF NOT EXISTS jobs (
+  id TEXT PRIMARY KEY,
+  host_id TEXT REFERENCES hosts(id),
+  policy_id TEXT REFERENCES policies(id),
+  status TEXT NOT NULL,
+  started_at INTEGER,
+  finished_at INTEGER,
+  bytes_new INTEGER,
+  bytes_total INTEGER,
+  error TEXT
+);
+
+CREATE TABLE IF NOT EXISTS snapshots (
+  id TEXT PRIMARY KEY,
+  host_id TEXT REFERENCES hosts(id),
+  job_id TEXT REFERENCES jobs(id),
+  repo_ref TEXT NOT NULL,
+  size_bytes INTEGER,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY,
+  username TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'admin'
+);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+  id TEXT PRIMARY KEY,
+  user_id TEXT,
+  action TEXT NOT NULL,
+  detail TEXT,
+  created_at INTEGER NOT NULL
+);
+";
+
+/// The catalog database.
+#[derive(Debug, Clone)]
+pub struct Catalog {
+    pool: SqlitePool,
+}
+
+impl Catalog {
+    /// Open (creating if needed) the catalog at `path`.
+    pub async fn open(path: &Path) -> Result<Self> {
+        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", path.display()))
+            .map_err(|e| Error::Catalog(e.to_string()))?
+            .journal_mode(SqliteJournalMode::Wal)
+            .foreign_keys(true)
+            .create_if_missing(true);
+        let pool = SqlitePool::connect_with(options)
+            .await
+            .map_err(|e| Error::Catalog(format!("opening catalog: {e}")))?;
+        sqlx::raw_sql(SCHEMA)
+            .execute(&pool)
+            .await
+            .map_err(|e| Error::Catalog(format!("creating schema: {e}")))?;
+        Ok(Self { pool })
+    }
+
+    /// A purely in-memory catalog (useful for tests and ephemeral use).
+    pub async fn in_memory() -> Result<Self> {
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")
+            .map_err(|e| Error::Catalog(e.to_string()))?
+            .foreign_keys(true);
+        let pool = SqlitePool::connect_with(options)
+            .await
+            .map_err(|e| Error::Catalog(format!("opening catalog: {e}")))?;
+        sqlx::raw_sql(SCHEMA)
+            .execute(&pool)
+            .await
+            .map_err(|e| Error::Catalog(format!("creating schema: {e}")))?;
+        Ok(Self { pool })
+    }
+
+    /// Register a host. `ssh_key_pem` is a PEM-encoded private key; it is
+    /// sealed with the control-plane key before it touches disk.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn add_host(
+        &self,
+        name: &str,
+        address: &str,
+        ssh_port: u16,
+        ssh_user: &str,
+        ssh_key_pem: &[u8],
+        mode: BackupMode,
+        master_key: &[u8; KEY_LEN],
+    ) -> Result<Host> {
+        if master_key.len() != KEY_LEN {
+            return Err(Error::Catalog("master key must be 32 bytes".into()));
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let created_at = now_secs();
+        let nonce = fresh_nonce();
+        let sealed = crypto::seal(
+            master_key,
+            &nonce,
+            &AeadContext::Host(&id).aad(),
+            ssh_key_pem,
+        )
+        .map_err(|e| Error::Catalog(format!("sealing ssh key: {e}")))?;
+        let mut blob = nonce.to_vec();
+        blob.extend_from_slice(&sealed);
+        sqlx::query(
+            "INSERT INTO hosts (id, name, address, ssh_port, ssh_user, ssh_key_encrypted, mode, status, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(name)
+        .bind(address)
+        .bind(i64::from(ssh_port))
+        .bind(ssh_user)
+        .bind(&blob[..])
+        .bind(mode.as_str())
+        .bind(HostStatus::Unknown.as_str())
+        .bind(created_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::Catalog(format!("inserting host: {e}")))?;
+        Ok(Host {
+            id,
+            name: name.to_string(),
+            address: address.to_string(),
+            ssh_port,
+            ssh_user: ssh_user.to_string(),
+            mode,
+            status: HostStatus::Unknown,
+            created_at,
+        })
+    }
+
+    /// List all registered hosts (no key material).
+    pub async fn list_hosts(&self) -> Result<Vec<Host>> {
+        let rows = sqlx::query(
+            "SELECT id, name, address, ssh_port, ssh_user, mode, status, created_at
+             FROM hosts ORDER BY created_at, id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| Error::Catalog(format!("listing hosts: {e}")))?;
+        rows.iter().map(host_from_row).collect()
+    }
+
+    /// Fetch one host by id (no key material).
+    pub async fn get_host(&self, id: &str) -> Result<Host> {
+        let row = sqlx::query(
+            "SELECT id, name, address, ssh_port, ssh_user, mode, status, created_at
+             FROM hosts WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| Error::Catalog(format!("fetching host: {e}")))?
+        .ok_or_else(|| Error::Catalog(format!("host `{id}` not found")))?;
+        host_from_row(&row)
+    }
+
+    /// Fetch one host together with its decrypted SSH key.
+    pub async fn get_host_with_key(
+        &self,
+        id: &str,
+        master_key: &[u8; KEY_LEN],
+    ) -> Result<HostWithKey> {
+        let row = sqlx::query("SELECT * FROM hosts WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| Error::Catalog(format!("fetching host: {e}")))?
+            .ok_or_else(|| Error::Catalog(format!("host `{id}` not found")))?;
+        let host = host_from_row(&row)?;
+        let sealed: Vec<u8> = row
+            .try_get("ssh_key_encrypted")
+            .map_err(|e| Error::Catalog(format!("reading ssh key column: {e}")))?;
+        let pem = crypto::open(master_key, &AeadContext::Host(id).aad(), &sealed)
+            .map_err(|_| Error::DecryptFailed("host ssh key".into()))?;
+        Ok(HostWithKey {
+            host,
+            ssh_key_pem: pem,
+        })
+    }
+
+    /// Update a host's reachability status.
+    pub async fn set_host_status(&self, id: &str, status: HostStatus) -> Result<()> {
+        let res = sqlx::query("UPDATE hosts SET status = ? WHERE id = ?")
+            .bind(status.as_str())
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::Catalog(format!("updating host status: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(Error::Catalog(format!("host `{id}` not found")));
+        }
+        Ok(())
+    }
+
+    /// Rotate a host's SSH key (re-seals the new PEM under the same id).
+    pub async fn set_host_key(
+        &self,
+        id: &str,
+        ssh_key_pem: &[u8],
+        master_key: &[u8; KEY_LEN],
+    ) -> Result<()> {
+        let nonce = fresh_nonce();
+        let sealed = crypto::seal(
+            master_key,
+            &nonce,
+            &AeadContext::Host(id).aad(),
+            ssh_key_pem,
+        )
+        .map_err(|e| Error::Catalog(format!("sealing ssh key: {e}")))?;
+        let mut blob = nonce.to_vec();
+        blob.extend_from_slice(&sealed);
+        let res = sqlx::query("UPDATE hosts SET ssh_key_encrypted = ? WHERE id = ?")
+            .bind(&blob[..])
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::Catalog(format!("updating ssh key: {e}")))?;
+        if res.rows_affected() == 0 {
+            return Err(Error::Catalog(format!("host `{id}` not found")));
+        }
+        Ok(())
+    }
+
+    /// Remove a host.
+    pub async fn remove_host(&self, id: &str) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM hosts WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::Catalog(format!("removing host: {e}")))?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Append an audit-log entry.
+    pub async fn audit(
+        &self,
+        user_id: Option<&str>,
+        action: &str,
+        detail: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO audit_log (id, user_id, action, detail, created_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(user_id)
+        .bind(action)
+        .bind(detail)
+        .bind(now_secs())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::Catalog(format!("writing audit log: {e}")))?;
+        Ok(())
+    }
+
+    /// Read the audit log, newest first.
+    pub async fn audit_log(&self, limit: i64) -> Result<Vec<AuditEntry>> {
+        let rows = sqlx::query(
+            "SELECT id, user_id, action, detail, created_at
+             FROM audit_log ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| Error::Catalog(format!("reading audit log: {e}")))?;
+        Ok(rows
+            .iter()
+            .map(|r| AuditEntry {
+                id: r.try_get(0).unwrap_or_default(),
+                user_id: r.try_get(1).unwrap_or(None),
+                action: r.try_get(2).unwrap_or_default(),
+                detail: r.try_get(3).unwrap_or(None),
+                created_at: r.try_get(4).unwrap_or_default(),
+            })
+            .collect())
+    }
+}
+
+/// One audit-log row.
+#[derive(Debug, Clone)]
+pub struct AuditEntry {
+    /// Row id (UUID v4).
+    pub id: String,
+    /// Acting user, if the action was attributed.
+    pub user_id: Option<String>,
+    /// Action name (e.g. `host.add`, `backup.run`).
+    pub action: String,
+    /// Optional free-form detail.
+    pub detail: Option<String>,
+    /// Seconds since the Unix epoch.
+    pub created_at: i64,
+}
+
+fn fresh_nonce() -> [u8; NONCE_LEN] {
+    let mut n = [0u8; NONCE_LEN];
+    getrandom::fill(&mut n).expect("OS CSPRNG unavailable");
+    n
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn host_from_row(row: &SqliteRow) -> Result<Host> {
+    let port: i64 = row
+        .try_get("ssh_port")
+        .map_err(|e| Error::Catalog(format!("reading ssh_port: {e}")))?;
+    let mode: String = row
+        .try_get("mode")
+        .map_err(|e| Error::Catalog(format!("reading mode: {e}")))?;
+    let status: String = row
+        .try_get("status")
+        .map_err(|e| Error::Catalog(format!("reading status: {e}")))?;
+    Ok(Host {
+        id: row.try_get("id").unwrap_or_default(),
+        name: row.try_get("name").unwrap_or_default(),
+        address: row.try_get("address").unwrap_or_default(),
+        ssh_port: u16::try_from(port)
+            .map_err(|_| Error::Catalog("ssh_port out of range".into()))?,
+        ssh_user: row.try_get("ssh_user").unwrap_or_default(),
+        mode: mode.parse()?,
+        status: status.parse()?,
+        created_at: row.try_get("created_at").unwrap_or_default(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_key() -> [u8; KEY_LEN] {
+        [7u8; KEY_LEN]
+    }
+
+    #[tokio::test]
+    async fn schema_creates_all_tables() {
+        let cat = Catalog::in_memory().await.unwrap();
+        // Every table in docs/05 exists.
+        for table in [
+            "hosts",
+            "policies",
+            "host_policies",
+            "jobs",
+            "snapshots",
+            "users",
+            "audit_log",
+        ] {
+            let n: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{table}'"
+            ))
+            .fetch_one(&cat.pool)
+            .await
+            .unwrap();
+            assert_eq!(n, 1, "table {table} missing");
+        }
+    }
+
+    #[tokio::test]
+    async fn host_crud_roundtrip() {
+        let cat = Catalog::in_memory().await.unwrap();
+        let key = test_key();
+
+        let host = cat
+            .add_host(
+                "web-1",
+                "10.0.0.5",
+                2222,
+                "root",
+                b"-----BEGIN KEY-----\nabc\n",
+                BackupMode::Agentless,
+                &key,
+            )
+            .await
+            .unwrap();
+        assert_eq!(host.ssh_port, 2222);
+        assert_eq!(host.mode, BackupMode::Agentless);
+        assert_eq!(host.status, HostStatus::Unknown);
+
+        let got = cat.get_host(&host.id).await.unwrap();
+        assert_eq!(got.name, "web-1");
+
+        let with_key = cat.get_host_with_key(&host.id, &key).await.unwrap();
+        assert_eq!(with_key.ssh_key_pem, b"-----BEGIN KEY-----\nabc\n");
+
+        // Wrong key must not decrypt.
+        let bad = [0u8; KEY_LEN];
+        assert!(cat.get_host_with_key(&host.id, &bad).await.is_err());
+
+        cat.set_host_status(&host.id, HostStatus::Reachable)
+            .await
+            .unwrap();
+        assert_eq!(
+            cat.get_host(&host.id).await.unwrap().status,
+            HostStatus::Reachable
+        );
+
+        // Key rotation round-trips.
+        cat.set_host_key(&host.id, b"new-pem", &key).await.unwrap();
+        assert_eq!(
+            cat.get_host_with_key(&host.id, &key)
+                .await
+                .unwrap()
+                .ssh_key_pem,
+            b"new-pem"
+        );
+
+        assert!(cat.remove_host(&host.id).await.unwrap());
+        assert!(cat.get_host(&host.id).await.is_err());
+        assert!(!cat.remove_host(&host.id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn audit_log_roundtrip() {
+        let cat = Catalog::in_memory().await.unwrap();
+        cat.audit(Some("u1"), "host.add", Some("web-1"))
+            .await
+            .unwrap();
+        cat.audit(None, "backup.run", None).await.unwrap();
+        let log = cat.audit_log(10).await.unwrap();
+        assert_eq!(log.len(), 2);
+        // Both same-second entries present (order within a second is
+        // nondeterministic because ids are random UUIDs).
+        let mut actions: Vec<&str> = log.iter().map(|e| e.action.as_str()).collect();
+        actions.sort_unstable();
+        assert_eq!(actions, ["backup.run", "host.add"]);
+        assert!(log
+            .iter()
+            .any(|e| e.action == "host.add" && e.user_id.as_deref() == Some("u1")));
+    }
+
+    #[tokio::test]
+    async fn on_disk_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.db");
+        let key = test_key();
+        {
+            let cat = Catalog::open(&path).await.unwrap();
+            cat.add_host(
+                "db-1",
+                "10.0.0.9",
+                22,
+                "ops",
+                b"pem",
+                BackupMode::Agent,
+                &key,
+            )
+            .await
+            .unwrap();
+        }
+        let cat = Catalog::open(&path).await.unwrap();
+        let hosts = cat.list_hosts().await.unwrap();
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].mode, BackupMode::Agent);
+        assert_eq!(
+            cat.get_host_with_key(&hosts[0].id, &key)
+                .await
+                .unwrap()
+                .ssh_key_pem,
+            b"pem"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_bad_enums() {
+        assert!("nope".parse::<BackupMode>().is_err());
+        assert!("nope".parse::<HostStatus>().is_err());
+    }
+}

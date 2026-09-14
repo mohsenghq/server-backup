@@ -59,10 +59,12 @@ pub enum AeadContext<'a> {
     Hash(&'a str),
     /// A repo document at a fixed key.
     Doc,
+    /// A host's encrypted SSH key, bound to the host id.
+    Host(&'a str),
 }
 
 impl AeadContext<'_> {
-    fn aad(&self) -> Vec<u8> {
+    pub(crate) fn aad(&self) -> Vec<u8> {
         match self {
             AeadContext::Hash(hex) => {
                 let mut aad = b"aegis/blob/v1:".to_vec();
@@ -70,6 +72,11 @@ impl AeadContext<'_> {
                 aad
             }
             AeadContext::Doc => DOC_CONTEXT.to_vec(),
+            AeadContext::Host(id) => {
+                let mut aad = b"aegis/host/v1:".to_vec();
+                aad.extend_from_slice(id.as_bytes());
+                aad
+            }
         }
     }
 }

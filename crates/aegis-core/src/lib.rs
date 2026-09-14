@@ -22,6 +22,7 @@
 pub mod agentless;
 pub mod backend;
 pub mod blobs;
+pub mod catalog;
 pub mod chunk;
 pub mod crypto;
 pub mod error;
@@ -35,6 +36,7 @@ pub mod tree;
 
 pub use agentless::backup_remote;
 pub use backend::{Backend, LocalBackend};
+pub use catalog::{AuditEntry, BackupMode, Catalog, Host, HostStatus, HostWithKey};
 pub use chunk::{Chunk, ChunkHash, ChunkerConfig};
 pub use error::{Error, Result};
 pub use keys::{AeadContext, KeyFile, PassphraseSource, RepoCrypto};
