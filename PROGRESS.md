@@ -6,11 +6,11 @@ This file is the single source of truth for "where are we." Read it first, every
 
 **Phase 1 — Core Engine (complete, pushed).** All eight checklist items in `ROADMAP.md` are implemented and tested.
 
-**Phase 2 — Agentless Remote Backup (in progress).** The SSH connection manager, the agentless remote-read backup mode, and the host inventory + SQLite catalog are implemented and tested; next up is capacity-aware multi-host CLI orchestration (`aegis host add`, `aegis host backup-all`).
+**Phase 2 — Agentless Remote Backup (in progress).** The SSH connection manager, the agentless remote-read backup mode, the host inventory + SQLite catalog, and the multi-host CLI orchestration (`aegis host add/list/remove/backup-all`) are implemented and tested; the last Phase 2 item is integration tests against a real SSH target (container).
 
 ## Current status
 
-The workspace builds, lints clean (`clippy -D warnings`, `fmt --check`), and 106 tests pass (59 unit + 22 backup/restore integration + 9 property + 5 SFTP + 5 SSH-manager + 3 agentless + criterion bench + CLI). `aegis` is a complete Phase 1 core engine; Phase 2 has started with the SSH connection manager (`aegis-core::ssh`).
+The workspace builds, lints clean (`clippy -D warnings`, `fmt --check`), and 107 tests pass (59 unit + 22 backup/restore integration + 9 property + 5 SFTP + 5 SSH-manager + 3 agentless + 1 host-inventory + criterion bench + CLI). `aegis` is a complete Phase 1 core engine; Phase 2 has started with the SSH connection manager (`aegis-core::ssh`).
 
 New in Phase 2:
 
@@ -19,6 +19,7 @@ New in Phase 2:
 - The in-process test SSH server (`tests/sftp_server.rs`) now answers `exec` requests (echo + exit 0), so exec paths are integration-tested without a real sshd; `tests/ssh_manager.rs` covers exec, exec_check, connection reuse across calls, explicit disconnect/reconnect, SFTP streaming over the shared connection, and clean auth-failure errors.
 - New workspace dependency: `getrandom = "0.3"` (ssh-key's `PrivateKey::random` needs rand_core 0.10, so the ed25519 keypair is generated from an OS-CSPRNG 32-byte seed via `Ed25519Keypair::from_seed`).
 - `aegis-core::catalog` — the SQLite catalog implementing the full `docs/05-data-model.md` schema (hosts, policies, host_policies, jobs, snapshots, users, audit_log), with the host inventory wired for CRUD: `add_host`/`list_hosts`/`get_host`/`get_host_with_key`/`set_host_status`/`set_host_key`/`remove_host`, plus `audit`/`audit_log`. SSH private keys are envelope-encrypted (XChaCha20-Poly1305 via a new `AeadContext::Host` binding to the host id, `aegis/host/v1:<id>`) before storage; a stolen catalog file yields no credentials. Backed by `sqlx` runtime queries (SQLite now; Postgres is a pool swap in Phase 3). Unit tests cover schema completeness, host CRUD + key rotation + wrong-key rejection, audit log, and on-disk persistence.
+- `aegis-cli host` — the host-inventory CLI: `host add` (with `--generate-key` creating a dedicated per-host ed25519 keypair and printing the public key for `authorized_keys`), `host list`, `host remove` (name/id-prefix match), and `host backup-all` (concurrent agentless backups of absolute remote paths across all catalog hosts, capped by `--concurrency`, failures reported without aborting, reachability written back to the catalog, exit 2 when any host fails). The catalog's master key is wrapped under a control-plane passphrase into a sidecar `<catalog>.key.json` (same Argon2id/XChaCha20 machinery as repo key files); `hosts.rs` in the CLI crate holds the wiring and mirrors `tests/host_inventory.rs` at the engine level.
 - `aegis-core::agentless` — the agentless remote-read backup: `backup_remote(repo, ssh, host, chunker, &[/abs/paths])` walks remote trees over the SFTP channel, streams every file through the new async chunker (`chunk_async_stream`, the tokio twin of `chunk_stream` — same boundaries, same hashes), dedups against the repository, and commits a snapshot byte-identical in format to a local one. Symlinks/non-regular remote entries are skipped, mirroring the local path. `Repository::store_chunk` and `Repository::commit_snapshot` were factored out of `backup` so both paths share the blob/index/manifest logic.
 - Integration tests (`tests/agentless.rs`) run against the in-process SFTP server: backup→deep-verify→byte-identical restore, the dedup property (a second unchanged run writes zero new chunks/nodes), and rejection of relative remote paths. `fastcdc` now enables its `tokio` feature (+ `tokio-stream` for stream iteration).
 
@@ -44,12 +45,13 @@ This session also fixed a real bug found by the property suite on Windows: `rest
 
 ## Next action
 
-Continue Phase 2: capacity-aware multi-host CLI orchestration — `aegis host add` / `aegis host list` / `aegis host backup-all`, wiring the CLI to the catalog and the agentless backup.
+Finish Phase 2: integration tests against a real SSH target (container), per the roadmap.
 
 ## Session log
 
 _(newest first — append one short entry per work session; do not delete old entries)_
 
+- **2026-09-14 (2)** — Multi-host CLI orchestration: `aegis host add/list/remove/backup-all` wired to the catalog and the agentless backup; catalog master key wrapped into a sidecar key file; `--generate-key` prints the public key for `authorized_keys`. 107 tests + clippy `-D warnings` + fmt green; CLI smoke-tested end-to-end (add → list → remove). Committed (push pending).
 - **2026-09-14** — Host inventory + SQLite catalog: `aegis-core::catalog` with the full docs/05 schema, host CRUD, audit log, and SSH keys envelope-encrypted under a new `AeadContext::Host` AAD binding. 106 tests + clippy `-D warnings` + fmt green; committed (push pending).
 - **2026-09-13 (2)** — Agentless remote-read backup complete: `aegis-core::agentless::backup_remote` streams remote files over the SSH manager's SFTP channel through a new async chunker, dedups, and commits snapshots identical in format to local ones. Refactored `Repository::backup` to share `store_chunk`/`commit_snapshot` with the new path. 101 tests + clippy `-D warnings` + fmt green; committed locally (push pending).
 - **2026-09-13** — Pushed the pending Phase 1 commits (CI now runs against the current tree) and started Phase 2: implemented the SSH connection manager in `aegis-core::ssh` (per-host connection cache, exec/exec_check, sftp_channel multiplexing, per-host ed25519 keypair generation), shared the connect/auth path with the SFTP backend, and taught the in-process test SSH server to answer exec. 98 tests + clippy `-D warnings` + fmt green; committed locally (push pending).
@@ -73,7 +75,7 @@ _(record any substitution of a library/approach from what the docs specify, with
 _(anything that needs a second look, or a question for the user before proceeding)_
 
 - **The merge, restore fix, and PROGRESS/ROADMAP updates are committed locally but not pushed**; CI has therefore still not run against the current tree (see next action).
-- **The Phase 2 work (SSH manager + agentless backup) is pushed; the catalog work is committed locally but not pushed.**
+- **The catalog work and the host CLI are committed locally but not pushed.**
 - **No mtime/size fast-path.** Every backup re-reads and re-hashes every file. Dedup means an unchanged tree writes nothing, but it does not yet approach "the speed of a metadata-only walk" as `docs/11-performance-targets.md` requires. The fast-path is described in `docs/03-repository-format.md`.
 - **`restore` verifies by size only, not by re-hashing**; `aegis verify --deep` is the full-hash path.
 - **Symlinks, hardlinks, empty directories, and non-regular files are skipped** by `backup`. Only regular files are captured. Needs a decision in Phase 1→2 transition on how to represent them in the tree format.

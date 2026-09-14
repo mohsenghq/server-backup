@@ -10,6 +10,8 @@
 
 use std::path::PathBuf;
 
+pub mod hosts;
+
 use aegis_core::backend::Backend;
 use aegis_core::sftp::{HostKeyPolicy, RepoLocation, SftpAuth, SftpBackend};
 use aegis_core::{ChunkerConfig, LocalBackend, PassphraseSource, Repository};
@@ -172,6 +174,87 @@ enum Command {
         /// decompress/decrypt, and re-check their hashes.
         #[arg(long)]
         deep: bool,
+    },
+
+    /// Manage the host inventory (the catalog). First use creates the
+    /// catalog and its master key.
+    #[command(subcommand)]
+    Host(HostCommand),
+}
+
+#[derive(Subcommand)]
+enum HostCommand {
+    /// Register a host in the catalog. With `--generate-key`, a fresh
+    /// ed25519 keypair is created: the private key is stored encrypted and
+    /// the public key is printed for the host's `authorized_keys`.
+    Add {
+        /// Path to the catalog database (created if missing).
+        #[arg(long, value_name = "FILE", default_value = "aegis-catalog.db")]
+        catalog: PathBuf,
+
+        /// Display name for the host.
+        #[arg(long, value_name = "NAME")]
+        name: String,
+
+        /// Hostname or IP the control plane connects to.
+        #[arg(long, value_name = "ADDRESS")]
+        address: String,
+
+        /// SSH port.
+        #[arg(long, value_name = "PORT", default_value_t = 22)]
+        port: u16,
+
+        /// SSH login user.
+        #[arg(long, value_name = "USER")]
+        user: String,
+
+        /// Generate a dedicated keypair instead of using the default SSH
+        /// key file (`~/.ssh/id_ed25519` / `id_rsa`) at backup time.
+        #[arg(long)]
+        generate_key: bool,
+
+        /// Backup mode (`agentless` or `agent`).
+        #[arg(long, value_name = "MODE", default_value = "agentless")]
+        mode: String,
+    },
+
+    /// List the hosts in the catalog.
+    List {
+        /// Path to the catalog database.
+        #[arg(long, value_name = "FILE", default_value = "aegis-catalog.db")]
+        catalog: PathBuf,
+    },
+
+    /// Remove a host from the catalog (by name or id prefix).
+    Remove {
+        /// Path to the catalog database.
+        #[arg(long, value_name = "FILE", default_value = "aegis-catalog.db")]
+        catalog: PathBuf,
+
+        /// The host's name or id (prefix ok).
+        #[arg(value_name = "HOST")]
+        host: String,
+    },
+
+    /// Back up one or more absolute remote paths on every host in the
+    /// catalog, concurrently (capacity-capped). Failing hosts are reported
+    /// and do not abort the run.
+    BackupAll {
+        /// Path to the catalog database.
+        #[arg(long, value_name = "FILE", default_value = "aegis-catalog.db")]
+        catalog: PathBuf,
+
+        /// Repository to write the snapshots into.
+        #[arg(long, value_name = "LOCATION")]
+        repo: String,
+
+        /// Absolute remote paths to back up on every host.
+        #[arg(value_name = "REMOTE_PATH", required = true)]
+        paths: Vec<String>,
+
+        /// Maximum hosts backed up at the same time.
+        #[arg(long, value_name = "N", default_value_t = 8)]
+        concurrency: usize,
     },
 }
 
@@ -384,6 +467,196 @@ async fn main() -> Result<()> {
                     report.tree_blobs
                 );
             });
+        }
+
+        Command::Host(HostCommand::Add {
+            catalog,
+            name,
+            address,
+            port,
+            user,
+            generate_key,
+            mode,
+        }) => {
+            let mode = hosts::parse_mode(&mode)?;
+            let handle = hosts::CatalogHandle::open(&catalog).await?;
+            let (key_pem, public_key) = if generate_key {
+                let (key, public) = hosts::generate_host_key(&format!("aegis:{name}"))?;
+                let pem = key
+                    .to_openssh(russh::keys::ssh_key::LineEnding::LF)
+                    .map_err(|e| anyhow!("encoding host key: {e}"))?
+                    .to_string();
+                (pem.into_bytes(), Some(public))
+            } else {
+                (Vec::new(), None)
+            };
+            let host = handle
+                .catalog
+                .add_host(
+                    &name,
+                    &address,
+                    port,
+                    &user,
+                    &key_pem,
+                    mode,
+                    handle.master_key(),
+                )
+                .await
+                .context("registering the host")?;
+            handle
+                .catalog
+                .audit(None, "host.add", Some(&name))
+                .await
+                .ok();
+            emit(
+                cli.json,
+                &serde_json::json!({
+                    "id": host.id,
+                    "name": host.name,
+                    "address": host.address,
+                    "port": host.ssh_port,
+                    "user": host.ssh_user,
+                    "mode": host.mode.as_str(),
+                    "public_key": public_key,
+                }),
+                || {
+                    println!("registered host {} ({})", host.name, host.id);
+                    if let Some(public) = &public_key {
+                        println!("add this line to the host's ~/.ssh/authorized_keys:");
+                        println!("  {public}");
+                    } else {
+                        println!(
+                            "no key stored; backups will use ~/.ssh/id_ed25519/id_rsa or AEGIS_SSH_PASSWORD"
+                        );
+                    }
+                },
+            );
+        }
+
+        Command::Host(HostCommand::List { catalog }) => {
+            let handle = hosts::CatalogHandle::open(&catalog).await?;
+            let list = handle.catalog.list_hosts().await?;
+            let list_json: Vec<serde_json::Value> = list
+                .iter()
+                .map(|h| {
+                    serde_json::json!({
+                        "id": h.id,
+                        "name": h.name,
+                        "address": h.address,
+                        "port": h.ssh_port,
+                        "user": h.ssh_user,
+                        "status": h.status.as_str(),
+                        "mode": h.mode.as_str(),
+                    })
+                })
+                .collect();
+            emit(cli.json, &list_json, || {
+                if list.is_empty() {
+                    println!("no hosts registered (use `aegis host add`)");
+                    return;
+                }
+                println!(
+                    "{:<10}  {:<20}  {:<24}  {:>5}  {:<10}  {:<11}  MODE",
+                    "ID", "NAME", "ADDRESS", "PORT", "USER", "STATUS"
+                );
+                for h in &list {
+                    println!(
+                        "{:<10}  {:<20}  {:<24}  {:>5}  {:<10}  {:<11}  {}",
+                        &h.id[..8.min(h.id.len())],
+                        h.name,
+                        h.address,
+                        h.ssh_port,
+                        h.ssh_user,
+                        h.status.as_str(),
+                        h.mode.as_str(),
+                    );
+                }
+            });
+        }
+
+        Command::Host(HostCommand::Remove { catalog, host }) => {
+            let handle = hosts::CatalogHandle::open(&catalog).await?;
+            let h = hosts::find_host(&handle, &host).await?;
+            let removed = handle.catalog.remove_host(&h.id).await?;
+            handle
+                .catalog
+                .audit(None, "host.remove", Some(&h.name))
+                .await
+                .ok();
+            emit(
+                cli.json,
+                &serde_json::json!({ "id": h.id, "name": h.name, "removed": removed }),
+                || println!("removed host {} ({})", h.name, &h.id[..8.min(h.id.len())]),
+            );
+        }
+
+        Command::Host(HostCommand::BackupAll {
+            catalog,
+            repo,
+            paths,
+            concurrency,
+        }) => {
+            for p in &paths {
+                if !p.starts_with('/') {
+                    return Err(anyhow!(
+                        "remote path `{p}` must be absolute (agentless mode reads remote files directly)"
+                    ));
+                }
+            }
+            let handle = hosts::CatalogHandle::open(&catalog).await?;
+            let repo = std::sync::Arc::new(open(&cli.ssh, &repo).await?);
+            let results = hosts::backup_all(
+                &handle,
+                repo,
+                paths,
+                cli.ssh.insecure_accept_host_key,
+                concurrency,
+            )
+            .await;
+            let ok: Vec<&hosts::HostRunResult> =
+                results.iter().filter(|r| r.error.is_none()).collect();
+            let failed: Vec<&hosts::HostRunResult> =
+                results.iter().filter(|r| r.error.is_some()).collect();
+            emit(
+                cli.json,
+                &serde_json::json!({
+                    "succeeded": ok.len(),
+                    "failed": failed.len(),
+                    "hosts": results.iter().map(|r| serde_json::json!({
+                        "host": r.name,
+                        "snapshot": r.snapshot.as_ref().map(|s| s.id.clone()),
+                        "error": r.error,
+                    })).collect::<Vec<_>>(),
+                }),
+                || {
+                    println!(
+                        "backup-all: {} succeeded, {} failed",
+                        ok.len(),
+                        failed.len()
+                    );
+                    for r in &ok {
+                        if let Some(s) = &r.snapshot {
+                            println!(
+                                "  {} — snapshot {} ({} files, {} new)",
+                                r.name,
+                                s.short_id(),
+                                s.stats.files,
+                                s.stats.new_chunks
+                            );
+                        }
+                    }
+                    for r in &failed {
+                        println!(
+                            "  {} — FAILED: {}",
+                            r.name,
+                            r.error.as_deref().unwrap_or("?")
+                        );
+                    }
+                    if !failed.is_empty() {
+                        std::process::exit(2);
+                    }
+                },
+            );
         }
     }
     Ok(())
