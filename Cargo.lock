@@ -38,6 +38,7 @@ version = "0.0.0"
 dependencies = [
  "aegis-core",
  "anyhow",
+ "atty",
  "clap",
  "rpassword",
  "russh",

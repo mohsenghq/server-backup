@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 
 pub mod hosts;
+mod users;
 
 use aegis_core::backend::Backend;
 use aegis_core::sftp::{HostKeyPolicy, RepoLocation, SftpAuth, SftpBackend};
@@ -66,6 +67,10 @@ struct SshArgs {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(about = "Manage local administrators of the control plane")]
+    User(users::UserArgs),
+    #[command(about = "Create, inspect, or revoke a local catalog session")]
+    Session(users::SessionArgs),
     /// Create a new, empty (encrypted) repository.
     Init {
         /// Directory to create the repository in, or an
@@ -468,6 +473,9 @@ async fn main() -> Result<()> {
                 );
             });
         }
+
+        Command::User(args) => users::run_user(&args.command, cli.json).await?,
+        Command::Session(args) => users::run_session(&args.command, cli.json).await?,
 
         Command::Host(HostCommand::Add {
             catalog,

@@ -22,6 +22,12 @@ use crate::crypto::{self, KEY_LEN, NONCE_LEN};
 use crate::error::{Error, Result};
 use crate::keys::AeadContext;
 
+#[allow(missing_docs)]
+#[path = "catalog_auth.rs"]
+pub mod auth;
+
+pub use auth::{Session, User};
+
 /// How a host is backed up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackupMode {
@@ -176,6 +182,19 @@ CREATE TABLE IF NOT EXISTS users (
   username TEXT UNIQUE NOT NULL,
   password_hash TEXT NOT NULL,
   role TEXT NOT NULL DEFAULT 'admin'
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+  token_hash TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires_at);
+CREATE TABLE IF NOT EXISTS login_limits (
+  bucket TEXT PRIMARY KEY,
+  window_start INTEGER NOT NULL,
+  attempts INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS audit_log (
@@ -509,6 +528,35 @@ mod tests {
             .unwrap();
             assert_eq!(n, 1, "table {table} missing");
         }
+    }
+
+    #[tokio::test]
+    async fn users_schema_defaults_to_admin_and_rejects_duplicate_usernames() {
+        let cat = Catalog::in_memory().await.unwrap();
+        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES (?, ?, ?)")
+            .bind("user-1")
+            .bind("admin")
+            .bind("test-only-placeholder")
+            .execute(&cat.pool)
+            .await
+            .unwrap();
+
+        let role: String = sqlx::query_scalar("SELECT role FROM users WHERE id = ?")
+            .bind("user-1")
+            .fetch_one(&cat.pool)
+            .await
+            .unwrap();
+        assert_eq!(role, "admin");
+
+        let duplicate =
+            sqlx::query("INSERT INTO users (id, username, password_hash) VALUES (?, ?, ?)")
+                .bind("user-2")
+                .bind("admin")
+                .bind("another-test-only-placeholder")
+                .execute(&cat.pool)
+                .await
+                .unwrap_err();
+        assert!(duplicate.as_database_error().unwrap().is_unique_violation());
     }
 
     #[tokio::test]

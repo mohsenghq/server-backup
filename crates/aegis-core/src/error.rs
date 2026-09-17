@@ -108,6 +108,18 @@ pub enum Error {
     #[error("catalog error: {0}")]
     Catalog(String),
 
+    #[allow(missing_docs)]
+    #[error("unauthorized")]
+    Unauthorized,
+
+    #[allow(missing_docs)]
+    #[error("login rate limit exceeded")]
+    RateLimited,
+
+    #[allow(missing_docs)]
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+
     /// The server's host key changed since it was first recorded.
     ///
     /// This is the classic machine-in-the-middle signal; the session is

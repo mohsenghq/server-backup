@@ -8,11 +8,11 @@ This file is the single source of truth for "where are we." Read it first, every
 
 **Phase 2 — Agentless Remote Backup (complete).** All five roadmap items are implemented and tested: the SSH connection manager, the agentless remote-read backup mode, the host inventory + SQLite catalog, the multi-host CLI orchestration (`aegis host add/list/remove/backup-all`), and containerized integration tests against a real sshd.
 
-**Phase 3 — Server, API, Scheduling (in progress).** The `aegis-server` axum skeleton is implemented and tested; next up is auth (local users, Argon2id password hashing, sessions).
+**Phase 3 — Server, API, Scheduling (in progress).** The `aegis-server` axum skeleton and auth (local admin users, Argon2id hashing, revocable bearer sessions, rate-limited login, protected API) are implemented and tested; next up is the scheduler.
 
 ## Current status
 
-The workspace builds, lints clean (`clippy -D warnings`, `fmt --check`), and 110 tests pass (59 unit + 22 backup/restore integration + 9 property + 5 SFTP + 5 SSH-manager + 3 agentless + 1 host-inventory + 1 real-sshd + 2 server-API + criterion bench + CLI). `aegis` is a complete Phase 1 core engine; Phase 2 has started with the SSH connection manager (`aegis-core::ssh`).
+The workspace builds, lints clean (`clippy -D warnings`, `fmt --check`), and 129 tests pass (76 unit incl. 16 auth + 22 backup/restore integration + 9 property + 5 SFTP + 5 SSH-manager + 3 agentless + 1 host-inventory + 1 real-sshd + 3 server-API + criterion bench + CLI).
 
 New in Phase 2:
 
@@ -48,11 +48,13 @@ This session also fixed a real bug found by the property suite on Windows: `rest
 
 ## Next action
 
-Continue Phase 3: auth (local users, Argon2id password hashing, sessions) over the `users` catalog table, then the scheduler.
+Continue Phase 3: the scheduler (`tokio-cron-scheduler`) driving policies from the catalog, then the job queue + worker pool.
 
 ## Session log
 
 _(newest first — append one short entry per work session; do not delete old entries)_
+
+- **2026-09-17** — Phase 3 auth complete: `aegis-core::catalog::auth` (admin users, Argon2id 64 MiB/3-pass hashing off-runtime via a bounded spawn_blocking semaphore, constant-work dummy verification for unknown users, opaque 32-byte base64url bearer tokens stored only as BLAKE3 hashes, 24 h expiry with lazy cleanup, atomic password-reset→session-revocation guarded by INSERT..SELECT on the current hash, persistent 30/min login throttle shared across pool clones); CLI-first `aegis user add/list/remove/passwd` + `aegis session login/logout/show` (passwords via `AEGIS_USER_PASSWORD` or prompt, never argv); server middleware protects every `/api` route except `/health` and `/api/auth/login`, adds `POST /api/auth/login|logout`, `GET /api/auth/me`, 401/429 handling, and user-attributed audit entries. 129 tests + clippy `-D warnings` + fmt green. Committed locally (push pending).
 
 - **2026-09-14 (4)** — Phase 3 started: `aegis-server` axum skeleton (health, host CRUD, host connectivity test, jobs/trigger running agentless backups in-process), 2 API integration tests + live smoke. 110 tests + clippy + fmt green. Committed (push pending).
 - **2026-09-14 (3)** — Final Phase 2 item: `tests/real_sshd.rs`, containerized integration tests against stock OpenSSH (`linuxserver/openssh-server`) gated behind `AEGIS_DOCKER_TESTS=1` with a daemon probe so they skip cleanly without Docker; CI gained a `docker-tests` job on ubuntu and `docker-compose.sshd.yml` gives developers the same harness. 108 tests + clippy + fmt green. Committed (push pending).

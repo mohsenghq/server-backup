@@ -3,6 +3,7 @@
 use axum::{
     extract::{Path as UrlPath, State},
     http::StatusCode,
+    middleware,
     response::IntoResponse,
     routing::{delete, get, post},
     Json, Router,
@@ -11,20 +12,110 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
 
-/// Build the application router.
+/// Build the application router. `/health` and `/api/auth/login` are public;
+/// everything under `/api` requires a valid bearer session.
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let public = Router::new()
         .route("/health", get(health))
+        .route("/api/auth/login", post(login))
+        .with_state(state.clone());
+    let protected = Router::new()
         .route("/api/hosts", post(add_host).get(list_hosts))
         .route("/api/hosts/{id}", delete(remove_host))
         .route("/api/hosts/{id}/test", post(test_host))
         .route("/api/jobs/trigger", post(trigger))
-        .with_state(state)
+        .route("/api/auth/logout", post(logout))
+        .route("/api/auth/me", get(me))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_session,
+        ))
+        .with_state(state);
+    public.merge(protected)
+}
+
+/// Bearer-token middleware: resolves the session user or answers 401.
+async fn require_session(
+    State(state): State<AppState>,
+    mut request: axum::extract::Request,
+    next: middleware::Next,
+) -> Result<axum::response::Response, ApiError> {
+    let header = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    let token = header.ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
+    let user = state
+        .catalog
+        .session_user(token)
+        .await
+        .map_err(|_| ApiError::unauthorized("invalid or expired session"))?;
+    request.extensions_mut().insert(user);
+    Ok(next.run(request).await)
 }
 
 /// `GET /health` — liveness.
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// `POST /api/auth/login` ⇔ `aegis session login`.
+#[derive(Deserialize)]
+pub struct LoginRequest {
+    pub username: String,
+    pub password: String,
+}
+
+async fn login(
+    State(state): State<AppState>,
+    Json(req): Json<LoginRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let session = state
+        .catalog
+        .login(&req.username, &req.password)
+        .await
+        .map_err(|e| match e {
+            aegis_core::Error::Unauthorized => ApiError::unauthorized("invalid credentials"),
+            aegis_core::Error::RateLimited => ApiError::too_many_requests("try again later"),
+            aegis_core::Error::InvalidInput(message) => ApiError::bad_request(message),
+            other => ApiError::internal(other.to_string()),
+        })?;
+    let _ = state
+        .catalog
+        .audit(Some(&session.user.id), "session.login", None)
+        .await;
+    Ok(Json(serde_json::json!({
+        "token": session.token,
+        "username": session.user.username,
+        "expires_at": session.expires_at,
+    })))
+}
+
+/// `POST /api/auth/logout` ⇔ `aegis session logout`.
+async fn logout(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
+    let revoked = state.catalog.logout(token).await?;
+    let _ = state.catalog.audit(None, "session.logout", None).await;
+    Ok(Json(serde_json::json!({ "revoked": revoked })))
+}
+
+/// `GET /api/auth/me` ⇔ `aegis session show`.
+async fn me(
+    axum::Extension(user): axum::Extension<aegis_core::catalog::auth::User>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    Ok(Json(serde_json::json!({
+        "id": user.id,
+        "username": user.username,
+        "role": user.role,
+    })))
 }
 
 /// `POST /api/hosts` ⇔ `aegis host add`.
@@ -53,6 +144,7 @@ fn default_mode() -> String {
 
 async fn add_host(
     State(state): State<AppState>,
+    axum::Extension(user): axum::Extension<aegis_core::catalog::auth::User>,
     Json(req): Json<AddHostRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let mode: aegis_core::catalog::BackupMode = req
@@ -71,7 +163,10 @@ async fn add_host(
             state.master_key(),
         )
         .await?;
-    let _ = state.catalog.audit(None, "host.add", Some(&req.name)).await;
+    let _ = state
+        .catalog
+        .audit(Some(&user.id), "host.add", Some(&req.name))
+        .await;
     Ok(Json(serde_json::json!({
         "id": host.id,
         "name": host.name,
@@ -103,13 +198,17 @@ async fn list_hosts(State(state): State<AppState>) -> Result<Json<serde_json::Va
 /// `DELETE /api/hosts/:id` ⇔ `aegis host remove`.
 async fn remove_host(
     State(state): State<AppState>,
+    axum::Extension(user): axum::Extension<aegis_core::catalog::auth::User>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let removed = state.catalog.remove_host(&id).await?;
     if !removed {
         return Err(ApiError::not_found(format!("host `{id}` not found")));
     }
-    let _ = state.catalog.audit(None, "host.remove", Some(&id)).await;
+    let _ = state
+        .catalog
+        .audit(Some(&user.id), "host.remove", Some(&id))
+        .await;
     Ok(Json(serde_json::json!({ "id": id, "removed": true })))
 }
 
@@ -177,6 +276,7 @@ struct TriggerResponse {
 
 async fn trigger(
     State(state): State<AppState>,
+    axum::Extension(user): axum::Extension<aegis_core::catalog::auth::User>,
     Json(req): Json<TriggerRequest>,
 ) -> Result<Json<TriggerResponse>, ApiError> {
     use aegis_core::sftp::SftpAuth;
@@ -264,7 +364,7 @@ async fn trigger(
         .await;
     let _ = state
         .catalog
-        .audit(None, "job.run", Some(&req.host_id))
+        .audit(Some(&user.id), "job.run", Some(&req.host_id))
         .await;
     Ok(Json(TriggerResponse {
         snapshot_id: snapshot.id,
@@ -290,6 +390,20 @@ impl ApiError {
     fn not_found(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            message: message.into(),
+        }
+    }
+
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+        }
+    }
+
+    fn too_many_requests(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
             message: message.into(),
         }
     }
