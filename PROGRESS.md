@@ -8,7 +8,7 @@ This file is the single source of truth for "where are we." Read it first, every
 
 **Phase 2 — Agentless Remote Backup (complete).** All five roadmap items are implemented and tested: the SSH connection manager, the agentless remote-read backup mode, the host inventory + SQLite catalog, the multi-host CLI orchestration (`aegis host add/list/remove/backup-all`), and containerized integration tests against a real sshd.
 
-**Phase 3 — Server, API, Scheduling (in progress).** The `aegis-server` axum skeleton and auth (local admin users, Argon2id hashing, revocable bearer sessions, rate-limited login, protected API) are implemented and tested; next up is the scheduler.
+**Phase 3 — Server, API, Scheduling (in progress).** The `aegis-server` axum skeleton, auth (local admin users, Argon2id hashing, revocable bearer sessions, rate-limited login, protected API), scheduler (`tokio-cron-scheduler` driving policies), and policy CRUD (CLI `aegis policy add/list/remove` + REST API routes `GET/POST /api/policies`, `DELETE /api/policies/{id}`) are implemented and tested; next up is the job queue + worker pool.
 
 ## Current status
 
@@ -38,8 +38,9 @@ What exists (Phase 0 items as before, plus all Phase 1 work):
   - `keys` — `RepoCrypto`/`KeyFile`/`PassphraseSource`: passphrase from `--passphrase-file`, `AEGIS_PASSPHRASE`, or interactive prompt.
   - `repo` — `init`/`open`/`init_with_kdf` over any `Box<dyn Backend>`; `backup` (deterministic sorted trees, one root hash per source path, per-snapshot `SnapshotIndex`); `list_snapshots`/`find_snapshot`; `restore` (streams chunk-by-chunk, bounded memory, unwraps both inline and ref'd synthetic roots); `verify` (shallow manifest/index check and deep full-tree hash re-derivation); `prune` with GFS retention (`retention.rs`: `RetentionPolicy`, `apply_policy`, keep-newest invariant) + garbage collection of unreferenced blobs.
   - `snapshot` — the `snapshots/<id>.json` manifest: id, time, hostname, paths, root, stats.
-- `aegis-cli` — `aegis init | backup | snapshots | restore | verify | prune`, plus a global `--json` mode; repo commands take `--passphrase-file FILE`, `AEGIS_PASSPHRASE`, or a TTY prompt; `backup`/`restore`/`init` accept `sftp://` repository URLs.
-- `aegis-server`, `aegis-agent`, `aegis-mcp` — compiling stubs only; they exit(1) with a "not implemented yet, see ROADMAP" message.
+- `aegis-cli` — `aegis host` (add/list/remove/backup-all) + `aegis user` (add/list/remove/passwd) + `aegis session` (login/logout/show) + `aegis policy` (add/list/remove); global `--json` mode.
+- `aegis-server` — the axum control-plane skeleton (first Phase 3 item): `lib.rs` + `state.rs` (shared `AppState` opening the catalog and its sidecar key file, `AEGIS_PASSPHRASE` required, no prompts) and `api.rs` with the `docs/06` routes: `GET /health`, `POST/GET /api/hosts`, `DELETE /api/hosts/{id}`, `POST /api/hosts/{id}/test` (real SSH connect + status write-back), `POST /api/jobs/trigger`, `GET/POST /api/policies`, `DELETE /api/policies/{id}`. `src/scheduler.rs` spawns `tokio-cron-scheduler`, loads enabled policies on startup, and runs `aegis_core::backup_remote` per host per policy on cron. `tests/api.rs` runs the router in-process (tower `oneshot`) plus a real-socket smoke of `serve()`, including policy CRUD integration tests. New workspace deps: `axum`, `tokio-cron-scheduler`, `sqlx`, `uuid`.
+- `aegis-agent`, `aegis-mcp` — compiling stubs only; they exit(1) with a "not implemented yet, see ROADMAP" message.
 - `benches/bench.rs` — criterion suite over chunking, hashing, and backup paths; wired into CI.
 - `tests/properties.rs` — proptest suite: chunker bounds/exact tiling, shift-resistant re-chunking under append, envelope round-trip, crypto tamper detection, retention invariants (never prunes newest, keeps ≥ keep_last), and an end-to-end arbitrary-tree backup→restore→dedup property. Saved regression seeds in `properties.proptest-regressions`.
 - `.github/workflows/ci.yml` — build + test on ubuntu/windows/macos, `fmt --check` + `clippy -D warnings` + criterion benchmarks on ubuntu.
@@ -48,11 +49,13 @@ This session also fixed a real bug found by the property suite on Windows: `rest
 
 ## Next action
 
-Continue Phase 3: the scheduler (`tokio-cron-scheduler`) driving policies from the catalog, then the job queue + worker pool.
+Continue Phase 3: the job queue + worker pool, then notifications and Prometheus metrics.
 
 ## Session log
 
 _(newest first — append one short entry per work session; do not delete old entries)_
+
+- **2026-09-18** — Phase 3 scheduler + policy CRUD complete: `aegis-core::catalog` gained `Policy` struct, `add_policy`/`list_policies`/`get_policy`/`update_policy`/`remove_policy`/`list_hosts_for_policy`/`record_job_*` CRUD methods, `now_secs()` (pub). `aegis-server/src/scheduler.rs` spawns `tokio-cron-scheduler`, loads enabled policies at startup, runs `aegis_core::backup_remote` per host per policy on cron. `aegis-cli/src/policy.rs` adds `aegis policy add/list/remove`. API routes added: `GET/POST /api/policies`, `DELETE /api/policies/{id}` (all bearer-protected). 4 server API integration tests (including policy CRUD), workspace-wide `cargo test` green. `cargo clippy -D warnings` + `cargo fmt --check` clean. Committed locally (push pending).
 
 - **2026-09-17** — Phase 3 auth complete: `aegis-core::catalog::auth` (admin users, Argon2id 64 MiB/3-pass hashing off-runtime via a bounded spawn_blocking semaphore, constant-work dummy verification for unknown users, opaque 32-byte base64url bearer tokens stored only as BLAKE3 hashes, 24 h expiry with lazy cleanup, atomic password-reset→session-revocation guarded by INSERT..SELECT on the current hash, persistent 30/min login throttle shared across pool clones); CLI-first `aegis user add/list/remove/passwd` + `aegis session login/logout/show` (passwords via `AEGIS_USER_PASSWORD` or prompt, never argv); server middleware protects every `/api` route except `/health` and `/api/auth/login`, adds `POST /api/auth/login|logout`, `GET /api/auth/me`, 401/429 handling, and user-attributed audit entries. 129 tests + clippy `-D warnings` + fmt green. Committed locally (push pending).
 

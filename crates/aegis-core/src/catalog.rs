@@ -147,7 +147,8 @@ CREATE TABLE IF NOT EXISTS policies (
   exclude_json TEXT NOT NULL,
   bandwidth_limit_kbps INTEGER,
   pre_hook TEXT,
-  post_hook TEXT
+  post_hook TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS host_policies (
@@ -446,6 +447,226 @@ impl Catalog {
             })
             .collect())
     }
+
+    /// Register a backup policy.
+    pub async fn add_policy(&self, policy: &Policy) -> Result<Policy> {
+        let id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO policies (id, name, schedule_cron, retention_json, paths_json, exclude_json, bandwidth_limit_kbps, pre_hook, post_hook, enabled)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+        )
+        .bind(&id)
+        .bind(&policy.name)
+        .bind(&policy.schedule_cron)
+        .bind(&policy.retention_json)
+        .bind(&policy.paths_json)
+        .bind(&policy.exclude_json)
+        .bind(policy.bandwidth_limit_kbps)
+        .bind(policy.pre_hook.clone())
+        .bind(policy.post_hook.clone())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| match e.as_database_error() {
+            Some(db) if db.is_unique_violation() => {
+                Error::InvalidInput(format!("policy name `{}` already exists", policy.name))
+            }
+            _ => Error::Catalog(format!("inserting policy: {e}")),
+        })?;
+        Ok(Policy {
+            id,
+            name: policy.name.clone(),
+            schedule_cron: policy.schedule_cron.clone(),
+            retention_json: policy.retention_json.clone(),
+            paths_json: policy.paths_json.clone(),
+            exclude_json: policy.exclude_json.clone(),
+            bandwidth_limit_kbps: policy.bandwidth_limit_kbps,
+            pre_hook: policy.pre_hook.clone(),
+            post_hook: policy.post_hook.clone(),
+            enabled: true,
+        })
+    }
+
+    /// List all policies.
+    pub async fn list_policies(&self) -> Result<Vec<Policy>> {
+        let rows = sqlx::query("SELECT id, name, schedule_cron, retention_json, paths_json, exclude_json, bandwidth_limit_kbps, pre_hook, post_hook, enabled FROM policies ORDER BY name")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Error::Catalog(format!("listing policies: {e}")))?;
+        rows.iter().map(Policy::from_row).collect()
+    }
+
+    /// Fetch one policy by id.
+    pub async fn get_policy(&self, id: &str) -> Result<Policy> {
+        let row = sqlx::query(
+            "SELECT id, name, schedule_cron, retention_json, paths_json, exclude_json, bandwidth_limit_kbps, pre_hook, post_hook, enabled FROM policies WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| Error::Catalog(format!("fetching policy: {e}")))?
+        .ok_or_else(|| Error::Catalog(format!("policy `{id}` not found")))?;
+        Policy::from_row(&row)
+    }
+
+    /// Update a policy (all fields except id are mutable).
+    pub async fn update_policy(&self, id: &str, policy: &Policy) -> Result<Policy> {
+        sqlx::query(
+            "UPDATE policies SET name = ?, schedule_cron = ?, retention_json = ?, paths_json = ?, exclude_json = ?, bandwidth_limit_kbps = ?, pre_hook = ?, post_hook = ?, enabled = ? WHERE id = ?",
+        )
+        .bind(&policy.name)
+        .bind(&policy.schedule_cron)
+        .bind(&policy.retention_json)
+        .bind(&policy.paths_json)
+        .bind(&policy.exclude_json)
+        .bind(policy.bandwidth_limit_kbps)
+        .bind(policy.pre_hook.clone())
+        .bind(policy.post_hook.clone())
+        .bind(policy.enabled)
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::Catalog(format!("updating policy: {e}")))?;
+        self.get_policy(id).await
+    }
+
+    /// List hosts attached to a policy via `host_policies`.
+    pub async fn list_hosts_for_policy(&self, policy_id: &str) -> Result<Vec<Host>> {
+        let rows = sqlx::query(
+            "SELECT h.id, h.name, h.address, h.ssh_port, h.ssh_user, h.mode, h.status, h.created_at
+             FROM host_policies hp
+             JOIN hosts h ON h.id = hp.host_id
+             WHERE hp.policy_id = ?",
+        )
+        .bind(policy_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| Error::Catalog(format!("listing hosts for policy: {e}")))?;
+        rows.iter().map(host_from_row).collect()
+    }
+
+    /// Remove a policy and its host-policy assignments.
+    pub async fn remove_policy(&self, id: &str) -> Result<bool> {
+        let res = sqlx::query("DELETE FROM policies WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::Catalog(format!("removing policy: {e}")))?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Record a new job run as `running`.
+    pub async fn record_job_started(
+        &self,
+        job_id: &str,
+        host_id: &str,
+        policy_id: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO jobs (id, host_id, policy_id, status, started_at) VALUES (?, ?, ?, 'running', ?)",
+        )
+        .bind(job_id)
+        .bind(host_id)
+        .bind(policy_id)
+        .bind(now_secs())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::Catalog(format!("recording job start: {e}")))?;
+        Ok(())
+    }
+
+    /// Mark a job as completed.
+    pub async fn record_job_completed(
+        &self,
+        job_id: &str,
+        bytes_new: i64,
+        bytes_total: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE jobs SET status = 'completed', finished_at = ?, bytes_new = ?, bytes_total = ? WHERE id = ?",
+        )
+        .bind(now_secs())
+        .bind(bytes_new)
+        .bind(bytes_total)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::Catalog(format!("recording job completion: {e}")))?;
+        Ok(())
+    }
+
+    /// Mark a job as failed.
+    pub async fn record_job_failed(&self, job_id: &str, error: &str) -> Result<()> {
+        sqlx::query("UPDATE jobs SET status = 'failed', finished_at = ?, error = ? WHERE id = ?")
+            .bind(now_secs())
+            .bind(error)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::Catalog(format!("recording job failure: {e}")))?;
+        Ok(())
+    }
+}
+
+/// A registered backup policy.
+#[derive(Debug, Clone)]
+pub struct Policy {
+    /// Stable identifier (UUID v4).
+    pub id: String,
+    /// Human-friendly name.
+    pub name: String,
+    /// Cron expression for the schedule.
+    pub schedule_cron: String,
+    /// Serialized retention configuration.
+    pub retention_json: String,
+    /// Serialized JSON array of absolute remote paths to back up.
+    pub paths_json: String,
+    /// Serialized JSON array of exclude patterns.
+    pub exclude_json: String,
+    /// Optional bandwidth limit in kbps.
+    pub bandwidth_limit_kbps: Option<i32>,
+    /// Pre-backup hook command.
+    pub pre_hook: Option<String>,
+    /// Post-backup hook command.
+    pub post_hook: Option<String>,
+    /// Whether the schedule is active.
+    pub enabled: bool,
+}
+
+impl Policy {
+    fn from_row(row: &SqliteRow) -> Result<Self> {
+        Ok(Policy {
+            id: row
+                .try_get("id")
+                .map_err(|e| Error::Catalog(format!("reading policy id: {e}")))?,
+            name: row
+                .try_get("name")
+                .map_err(|e| Error::Catalog(format!("reading policy name: {e}")))?,
+            schedule_cron: row
+                .try_get("schedule_cron")
+                .map_err(|e| Error::Catalog(format!("reading schedule_cron: {e}")))?,
+            retention_json: row
+                .try_get("retention_json")
+                .map_err(|e| Error::Catalog(format!("reading retention_json: {e}")))?,
+            paths_json: row
+                .try_get("paths_json")
+                .map_err(|e| Error::Catalog(format!("reading paths_json: {e}")))?,
+            exclude_json: row
+                .try_get("exclude_json")
+                .map_err(|e| Error::Catalog(format!("reading exclude_json: {e}")))?,
+            bandwidth_limit_kbps: row
+                .try_get("bandwidth_limit_kbps")
+                .map_err(|e| Error::Catalog(format!("reading bandwidth_limit_kbps: {e}")))?,
+            pre_hook: row
+                .try_get("pre_hook")
+                .map_err(|e| Error::Catalog(format!("reading pre_hook: {e}")))?,
+            post_hook: row
+                .try_get("post_hook")
+                .map_err(|e| Error::Catalog(format!("reading post_hook: {e}")))?,
+            enabled: row
+                .try_get("enabled")
+                .map_err(|e| Error::Catalog(format!("reading enabled: {e}")))?,
+        })
+    }
 }
 
 /// One audit-log row.
@@ -469,7 +690,8 @@ fn fresh_nonce() -> [u8; NONCE_LEN] {
     n
 }
 
-fn now_secs() -> i64 {
+/// Returns the current Unix timestamp in seconds.
+pub fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)

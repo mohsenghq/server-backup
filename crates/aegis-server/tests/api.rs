@@ -127,6 +127,9 @@ async fn health_and_host_crud() {
         (axum::http::Method::DELETE, "/api/hosts/whatever"),
         (axum::http::Method::POST, "/api/hosts/whatever/test"),
         (axum::http::Method::POST, "/api/jobs/trigger"),
+        (axum::http::Method::GET, "/api/policies"),
+        (axum::http::Method::POST, "/api/policies"),
+        (axum::http::Method::DELETE, "/api/policies/whatever"),
         (axum::http::Method::GET, "/api/auth/me"),
         (axum::http::Method::POST, "/api/auth/logout"),
     ] {
@@ -378,6 +381,78 @@ async fn trigger_runs_agentless_backup() {
     let resp = reqwest_free(bound).await;
     assert!(resp.contains("ok"), "health via serve(): {resp}");
     server.abort();
+}
+
+#[tokio::test]
+async fn policy_crud() {
+    let dir = TempDir::new().unwrap();
+    let catalog_path = dir.path().join("catalog.db");
+    seed_admin(&catalog_path).await;
+    let app = app(&catalog_path).await;
+    let token = login_token(&app, "admin", "admin-password-123").await;
+
+    // List starts empty.
+    let (_, body): (_, serde_json::Value) = authed_json_response(
+        app.clone(),
+        axum::http::Method::GET,
+        "/api/policies",
+        &token,
+        None,
+    )
+    .await;
+    assert!(body.as_array().unwrap().is_empty());
+
+    // Add a policy.
+    let (status, body): (_, serde_json::Value) = authed_json_response(
+        app.clone(),
+        axum::http::Method::POST,
+        "/api/policies",
+        &token,
+        Some(serde_json::json!({
+            "name": "daily-backup",
+            "schedule_cron": "0 2 * * *",
+            "retention_json": "{\"keep_daily\":7}",
+            "paths_json": "[\"/etc\",\"/var\"]",
+            "exclude_json": "[]",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "add failed: {body}");
+    let policy_id = body["id"].as_str().unwrap().to_string();
+    assert_eq!(body["name"], "daily-backup");
+
+    // List contains it.
+    let (_, body): (_, serde_json::Value) = authed_json_response(
+        app.clone(),
+        axum::http::Method::GET,
+        "/api/policies",
+        &token,
+        None,
+    )
+    .await;
+    let list = body.as_array().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0]["name"], "daily-backup");
+
+    // Delete it; a second delete 404s.
+    let (status, _): (_, serde_json::Value) = authed_json_response(
+        app.clone(),
+        axum::http::Method::DELETE,
+        &format!("/api/policies/{policy_id}"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _): (_, serde_json::Value) = authed_json_response(
+        app.clone(),
+        axum::http::Method::DELETE,
+        &format!("/api/policies/{policy_id}"),
+        &token,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 async fn reqwest_free(addr: SocketAddr) -> String {

@@ -8,6 +8,7 @@
 //! `POST /api/jobs/trigger` ⇔ `aegis host backup-all` (single host).
 
 pub mod api;
+pub mod scheduler;
 pub mod state;
 
 use std::net::SocketAddr;
@@ -15,8 +16,16 @@ use std::net::SocketAddr;
 use anyhow::{Context, Result};
 
 /// Run the HTTP server on `addr` with a catalog at `catalog_path`.
+/// The scheduler is spawned as a background task and reads policies
+/// from the catalog on startup.
 pub async fn serve(addr: SocketAddr, catalog_path: std::path::PathBuf) -> Result<()> {
-    let app_state = state::AppState::open(catalog_path).await?;
+    let app_state = state::AppState::open(&catalog_path).await?;
+    let scheduler = scheduler::start(
+        app_state.catalog.clone(),
+        *app_state.master_key(),
+        catalog_path.clone(),
+    )
+    .await?;
     let app = api::router(app_state);
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -24,5 +33,6 @@ pub async fn serve(addr: SocketAddr, catalog_path: std::path::PathBuf) -> Result
     axum::serve(listener, app)
         .await
         .context("running the HTTP server")?;
+    drop(scheduler);
     Ok(())
 }

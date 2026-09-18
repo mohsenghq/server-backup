@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
 
+use aegis_core::catalog::Policy;
+use uuid::Uuid;
+
 /// Build the application router. `/health` and `/api/auth/login` are public;
 /// everything under `/api` requires a valid bearer session.
 pub fn router(state: AppState) -> Router {
@@ -24,6 +27,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/hosts/{id}", delete(remove_host))
         .route("/api/hosts/{id}/test", post(test_host))
         .route("/api/jobs/trigger", post(trigger))
+        .route("/api/policies", get(list_policies).post(add_policy))
+        .route("/api/policies/{id}", delete(remove_policy))
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/me", get(me))
         .layer(middleware::from_fn_with_state(
@@ -371,6 +376,79 @@ async fn trigger(
         files: snapshot.stats.files,
         new_chunks: snapshot.stats.new_chunks,
     }))
+}
+
+/// `GET /api/policies` ⇔ `aegis policy list`.
+async fn list_policies(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let policies = state.catalog.list_policies().await?;
+    Ok(Json(serde_json::json!(policies
+        .iter()
+        .map(|p| serde_json::json!({
+            "id": p.id,
+            "name": p.name,
+            "schedule_cron": p.schedule_cron,
+            "enabled": p.enabled,
+        }))
+        .collect::<Vec<_>>())))
+}
+
+/// `POST /api/policies` ⇔ `aegis policy add`.
+#[derive(Deserialize)]
+pub struct AddPolicyRequest {
+    pub name: String,
+    pub schedule_cron: String,
+    pub retention_json: String,
+    pub paths_json: String,
+    pub exclude_json: String,
+    #[serde(default)]
+    pub bandwidth_limit_kbps: Option<i32>,
+    #[serde(default)]
+    pub pre_hook: Option<String>,
+    #[serde(default)]
+    pub post_hook: Option<String>,
+}
+
+async fn add_policy(
+    State(state): State<AppState>,
+    axum::Extension(user): axum::Extension<aegis_core::catalog::auth::User>,
+    Json(req): Json<AddPolicyRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let policy = Policy {
+        id: Uuid::new_v4().to_string(),
+        name: req.name.clone(),
+        schedule_cron: req.schedule_cron.clone(),
+        retention_json: req.retention_json.clone(),
+        paths_json: req.paths_json.clone(),
+        exclude_json: req.exclude_json.clone(),
+        bandwidth_limit_kbps: req.bandwidth_limit_kbps,
+        pre_hook: req.pre_hook,
+        post_hook: req.post_hook,
+        enabled: true,
+    };
+    let policy = state.catalog.add_policy(&policy).await.map_err(|e| match e {
+        aegis_core::Error::InvalidInput(message) => ApiError::bad_request(message),
+        other => ApiError::internal(other.to_string()),
+    })?;
+    let _ = state.catalog.audit(Some(&user.id), "policy.add", Some(&req.name)).await;
+    Ok(Json(serde_json::json!({
+        "id": policy.id,
+        "name": policy.name,
+        "schedule_cron": policy.schedule_cron,
+    })))
+}
+
+/// `DELETE /api/policies/{id}` ⇔ `aegis policy remove`.
+async fn remove_policy(
+    State(state): State<AppState>,
+    axum::Extension(user): axum::Extension<aegis_core::catalog::auth::User>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let removed = state.catalog.remove_policy(&id).await?;
+    if !removed {
+        return Err(ApiError::not_found(format!("policy `{id}` not found")));
+    }
+    let _ = state.catalog.audit(Some(&user.id), "policy.remove", Some(&id)).await;
+    Ok(Json(serde_json::json!({ "id": id, "removed": true })))
 }
 
 /// Uniform JSON error responses.

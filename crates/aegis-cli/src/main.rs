@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 
 pub mod hosts;
+mod policy;
 mod users;
 
 use aegis_core::backend::Backend;
@@ -71,6 +72,8 @@ enum Command {
     User(users::UserArgs),
     #[command(about = "Create, inspect, or revoke a local catalog session")]
     Session(users::SessionArgs),
+    /// Manage backup policies (the scheduler reads these).
+    Policy(policy::PolicyArgs),
     /// Create a new, empty (encrypted) repository.
     Init {
         /// Directory to create the repository in, or an
@@ -477,6 +480,7 @@ async fn main() -> Result<()> {
         Command::User(args) => users::run_user(&args.command, cli.json).await?,
         Command::Session(args) => users::run_session(&args.command, cli.json).await?,
 
+        Command::Policy(args) => policy::run(&args.command, cli.json).await?,
         Command::Host(HostCommand::Add {
             catalog,
             name,
