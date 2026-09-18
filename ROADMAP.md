@@ -36,11 +36,11 @@ Static plan — what "done" means for each phase. Work top to bottom, in order. 
 - [x] Auth: local users, Argon2 password hashing, sessions
 - [x] Scheduler (`tokio-cron-scheduler`) driving policies
 - [x] Policy CRUD (`aegis policy add/list/remove` + REST API routes)
-- [ ] Job queue + worker pool
-- [ ] Notifications: webhook, Telegram, email
-- [ ] Prometheus `/metrics` endpoint
-- [ ] Structured logging (`tracing`)
-- [ ] Integration tests against the API
+- [x] Job queue + worker pool
+- [x] Notifications: webhook, Telegram, email
+- [x] Prometheus `/metrics` endpoint
+- [x] Structured logging (`tracing`)
+- [x] Integration tests against the API
 
 ## Phase 4 — Web UI
 

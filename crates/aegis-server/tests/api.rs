@@ -455,6 +455,26 @@ async fn policy_crud() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn job_listing() {
+    let dir = TempDir::new().unwrap();
+    let catalog_path = dir.path().join("catalog.db");
+    seed_admin(&catalog_path).await;
+    let app = app(&catalog_path).await;
+    let token = login_token(&app, "admin", "admin-password-123").await;
+
+    // List starts empty.
+    let (_, body): (_, serde_json::Value) = authed_json_response(
+        app.clone(),
+        axum::http::Method::GET,
+        "/api/jobs",
+        &token,
+        None,
+    )
+    .await;
+    assert!(body.as_array().unwrap().is_empty());
+}
+
 async fn reqwest_free(addr: SocketAddr) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();

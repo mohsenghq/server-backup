@@ -8,6 +8,7 @@
 //! `POST /api/jobs/trigger` ⇔ `aegis host backup-all` (single host).
 
 pub mod api;
+pub mod jobs;
 pub mod scheduler;
 pub mod state;
 

@@ -13,6 +13,7 @@
 use std::path::Path;
 use std::str::FromStr;
 
+use serde::Serialize;
 use sqlx::{
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqliteRow},
     Row,
@@ -605,6 +606,100 @@ impl Catalog {
             .map_err(|e| Error::Catalog(format!("recording job failure: {e}")))?;
         Ok(())
     }
+
+    /// List jobs with optional filters (host_id, policy_id, status).
+    /// Results are newest-first, paginated.
+    pub async fn list_jobs(
+        &self,
+        host_id: Option<&str>,
+        policy_id: Option<&str>,
+        status: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<Job>> {
+        let mut sql = String::from("SELECT id, host_id, policy_id, status, started_at, finished_at, bytes_new, bytes_total, error FROM jobs WHERE 1=1");
+        if host_id.is_some() {
+            sql.push_str(" AND host_id = ?");
+        }
+        if policy_id.is_some() {
+            sql.push_str(" AND policy_id = ?");
+        }
+        if status.is_some() {
+            sql.push_str(" AND status = ?");
+        }
+        sql.push_str(" ORDER BY started_at DESC LIMIT ? OFFSET ?");
+        let mut query = sqlx::query(&sql);
+        if let Some(h) = host_id {
+            query = query.bind(h);
+        }
+        if let Some(p) = policy_id {
+            query = query.bind(p);
+        }
+        if let Some(s) = status {
+            query = query.bind(s);
+        }
+        query = query.bind(limit).bind(offset);
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Error::Catalog(format!("listing jobs: {e}")))?;
+        rows.iter().map(job_from_row).collect()
+    }
+}
+
+/// A job record from the catalog.
+#[derive(Debug, Clone, Serialize)]
+pub struct Job {
+    /// Stable identifier (UUID v4).
+    pub id: String,
+    /// Host this job ran against.
+    pub host_id: String,
+    /// Policy this job ran under.
+    pub policy_id: String,
+    /// Current status: `running`, `completed`, or `failed`.
+    pub status: String,
+    /// Seconds since Unix epoch when the job started.
+    pub started_at: i64,
+    /// Seconds since Unix epoch when the job finished.
+    pub finished_at: Option<i64>,
+    /// New bytes written to the backend by this job.
+    pub bytes_new: i64,
+    /// Total bytes read from the source by this job.
+    pub bytes_total: i64,
+    /// Error message if the job failed.
+    pub error: Option<String>,
+}
+
+fn job_from_row(row: &SqliteRow) -> Result<Job> {
+    Ok(Job {
+        id: row
+            .try_get("id")
+            .map_err(|e| Error::Catalog(format!("reading job id: {e}")))?,
+        host_id: row
+            .try_get("host_id")
+            .map_err(|e| Error::Catalog(format!("reading job host_id: {e}")))?,
+        policy_id: row
+            .try_get("policy_id")
+            .map_err(|e| Error::Catalog(format!("reading job policy_id: {e}")))?,
+        status: row
+            .try_get("status")
+            .map_err(|e| Error::Catalog(format!("reading job status: {e}")))?,
+        started_at: row
+            .try_get("started_at")
+            .map_err(|e| Error::Catalog(format!("reading job started_at: {e}")))?,
+        finished_at: row
+            .try_get("finished_at")
+            .map_err(|e| Error::Catalog(format!("reading job finished_at: {e}")))?,
+        bytes_new: row
+            .try_get("bytes_new")
+            .map_err(|e| Error::Catalog(format!("reading job bytes_new: {e}")))?,
+        bytes_total: row
+            .try_get("bytes_total")
+            .map_err(|e| Error::Catalog(format!("reading job bytes_total: {e}")))?,
+        error: row
+            .try_get("error")
+            .map_err(|e| Error::Catalog(format!("reading job error: {e}")))?,
+    })
 }
 
 /// A registered backup policy.

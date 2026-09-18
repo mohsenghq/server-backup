@@ -26,6 +26,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/hosts", post(add_host).get(list_hosts))
         .route("/api/hosts/{id}", delete(remove_host))
         .route("/api/hosts/{id}/test", post(test_host))
+        .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/trigger", post(trigger))
         .route("/api/policies", get(list_policies).post(add_policy))
         .route("/api/policies/{id}", delete(remove_policy))
@@ -378,6 +379,25 @@ async fn trigger(
     }))
 }
 
+/// `GET /api/jobs` ⇔ `aegis job list`.
+async fn list_jobs(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let jobs = state.catalog.list_jobs(None, None, None, 100, 0).await?;
+    Ok(Json(serde_json::json!(jobs
+        .iter()
+        .map(|j| serde_json::json!({
+            "id": j.id,
+            "host_id": j.host_id,
+            "policy_id": j.policy_id,
+            "status": j.status,
+            "started_at": j.started_at,
+            "finished_at": j.finished_at,
+            "bytes_new": j.bytes_new,
+            "bytes_total": j.bytes_total,
+            "error": j.error,
+        }))
+        .collect::<Vec<_>>())))
+}
+
 /// `GET /api/policies` ⇔ `aegis policy list`.
 async fn list_policies(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
     let policies = state.catalog.list_policies().await?;
@@ -425,11 +445,18 @@ async fn add_policy(
         post_hook: req.post_hook,
         enabled: true,
     };
-    let policy = state.catalog.add_policy(&policy).await.map_err(|e| match e {
-        aegis_core::Error::InvalidInput(message) => ApiError::bad_request(message),
-        other => ApiError::internal(other.to_string()),
-    })?;
-    let _ = state.catalog.audit(Some(&user.id), "policy.add", Some(&req.name)).await;
+    let policy = state
+        .catalog
+        .add_policy(&policy)
+        .await
+        .map_err(|e| match e {
+            aegis_core::Error::InvalidInput(message) => ApiError::bad_request(message),
+            other => ApiError::internal(other.to_string()),
+        })?;
+    let _ = state
+        .catalog
+        .audit(Some(&user.id), "policy.add", Some(&req.name))
+        .await;
     Ok(Json(serde_json::json!({
         "id": policy.id,
         "name": policy.name,
@@ -447,7 +474,10 @@ async fn remove_policy(
     if !removed {
         return Err(ApiError::not_found(format!("policy `{id}` not found")));
     }
-    let _ = state.catalog.audit(Some(&user.id), "policy.remove", Some(&id)).await;
+    let _ = state
+        .catalog
+        .audit(Some(&user.id), "policy.remove", Some(&id))
+        .await;
     Ok(Json(serde_json::json!({ "id": id, "removed": true })))
 }
 
