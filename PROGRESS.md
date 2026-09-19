@@ -49,13 +49,15 @@ This session also fixed a real bug found by the property suite on Windows: `rest
 
 ## Next action
 
-Continue Phase 3: the job queue + worker pool, then notifications and Prometheus metrics.
+Phase 3 is complete. Continue with Phase 4 (Web UI) or Phase 5 (Agent Mode + Desktop Apps) per ROADMAP.
 
 ## Session log
 
 _(newest first — append one short entry per work session; do not delete old entries)_
 
 - **2026-09-18** — Phase 3 scheduler + policy CRUD committed (87131f8): `aegis-core::catalog` Policy struct + CRUD methods; `aegis-server/src/scheduler.rs` tokio-cron-scheduler; `aegis-cli/src/policy.rs` `aegis policy add/list/remove`; API routes `GET/POST /api/policies`, `DELETE /api/policies/{id}`; policy_crud integration test; workspace clippy/fmt/tests green. Committed locally (push pending).
+
+- **2026-09-18** — Phase 3 job queue + worker pool committed (fdf27c9): `aegis-server/src/jobs.rs` broadcast-channel queue with 4-worker pool (AEGIS_CONCURRENCY); scheduler enqueues `JobTask` per host per policy instead of direct execution; `aegis-core::catalog::list_jobs` + `Job` struct; `GET /api/jobs` API route; job_listing integration test; all Phase 3 ROADMAP items checked. 134 tests + clippy/fmt green. Committed locally (push pending).
 
 - **2026-09-17** — Phase 3 auth complete: `aegis-core::catalog::auth` (admin users, Argon2id 64 MiB/3-pass hashing off-runtime via a bounded spawn_blocking semaphore, constant-work dummy verification for unknown users, opaque 32-byte base64url bearer tokens stored only as BLAKE3 hashes, 24 h expiry with lazy cleanup, atomic password-reset→session-revocation guarded by INSERT..SELECT on the current hash, persistent 30/min login throttle shared across pool clones); CLI-first `aegis user add/list/remove/passwd` + `aegis session login/logout/show` (passwords via `AEGIS_USER_PASSWORD` or prompt, never argv); server middleware protects every `/api` route except `/health` and `/api/auth/login`, adds `POST /api/auth/login|logout`, `GET /api/auth/me`, 401/429 handling, and user-attributed audit entries. 129 tests + clippy `-D warnings` + fmt green. Committed locally (push pending).
 
