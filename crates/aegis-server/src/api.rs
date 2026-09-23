@@ -29,6 +29,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/hosts", post(add_host).get(list_hosts))
         .route("/api/hosts/{id}", delete(remove_host))
         .route("/api/hosts/{id}/test", post(test_host))
+        .route("/api/hosts/{id}/key", post(rotate_host_key))
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/ws", get(jobs_ws))
         .route("/api/jobs/trigger", post(trigger))
@@ -36,6 +37,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/policies/{id}", delete(remove_policy))
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/me", get(me))
+        .route("/api/audit", get(audit_log))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_session,
@@ -75,6 +77,21 @@ async fn require_session(
         .map_err(|_| ApiError::unauthorized("invalid or expired session"))?;
     request.extensions_mut().insert(user);
     Ok(next.run(request).await)
+}
+
+/// `GET /api/audit` — the audit log, newest first.
+async fn audit_log(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let entries = state.catalog.audit_log(200).await?;
+    Ok(Json(serde_json::json!(entries
+        .iter()
+        .map(|e| serde_json::json!({
+            "id": e.id,
+            "user_id": e.user_id,
+            "action": e.action,
+            "detail": e.detail,
+            "created_at": e.created_at,
+        }))
+        .collect::<Vec<_>>())))
 }
 
 /// `GET /health` — liveness.
@@ -232,6 +249,31 @@ async fn remove_host(
         .audit(Some(&user.id), "host.remove", Some(&id))
         .await;
     Ok(Json(serde_json::json!({ "id": id, "removed": true })))
+}
+
+/// `POST /api/hosts/{id}/key` — rotate the host's stored SSH key.
+#[derive(Deserialize)]
+pub struct RotateKeyRequest {
+    /// OpenSSH PEM private key to store (envelope-encrypted in the catalog).
+    pub ssh_key_pem: String,
+}
+
+async fn rotate_host_key(
+    State(state): State<AppState>,
+    axum::Extension(user): axum::Extension<aegis_core::catalog::auth::User>,
+    UrlPath(id): UrlPath<String>,
+    Json(req): Json<RotateKeyRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    state
+        .catalog
+        .set_host_key(&id, req.ssh_key_pem.as_bytes(), state.master_key())
+        .await
+        .map_err(|e| ApiError::not_found(e.to_string()))?;
+    let _ = state
+        .catalog
+        .audit(Some(&user.id), "host.key_rotate", Some(&id))
+        .await;
+    Ok(Json(serde_json::json!({ "rotated": true })))
 }
 
 /// `POST /api/hosts/:id/test` — attempt an SSH connect, update status.

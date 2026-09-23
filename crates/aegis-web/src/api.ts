@@ -80,6 +80,52 @@ export const me = () => request<Me>('/api/auth/me')
 
 export const listHosts = () => request<Host[]>('/api/hosts')
 
+export interface Policy {
+  id: string
+  name: string
+  schedule_cron: string
+  retention_json: string
+  paths_json: string
+  exclude_json: string
+  bandwidth_limit_kbps: number | null
+  pre_hook: string | null
+  post_hook: string | null
+  enabled: boolean
+}
+
+export interface AddPolicy {
+  name: string
+  schedule_cron: string
+  retention_json: string
+  paths_json: string
+  exclude_json?: string
+  bandwidth_limit_kbps?: number | null
+  pre_hook?: string | null
+  post_hook?: string | null
+}
+
+export const listPolicies = () => request<Policy[]>('/api/policies')
+export const addPolicy = (p: AddPolicy) =>
+  request<Policy>('/api/policies', { method: 'POST', body: JSON.stringify(p) })
+export const removePolicy = (id: string) =>
+  request<{ removed: boolean }>(`/api/policies/${id}`, { method: 'DELETE' })
+
+export interface AuditEntry {
+  id: string
+  user_id: string | null
+  action: string
+  detail: string | null
+  created_at: number
+}
+
+export const auditLog = () => request<AuditEntry[]>('/api/audit')
+
+export const rotateHostKey = (id: string, sshKeyPem: string) =>
+  request<{ rotated: boolean }>(`/api/hosts/${id}/key`, {
+    method: 'POST',
+    body: JSON.stringify({ ssh_key_pem: sshKeyPem }),
+  })
+
 export interface AddHost {
   name: string
   address: string

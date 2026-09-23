@@ -49,11 +49,13 @@ This session also fixed a real bug found by the property suite on Windows: `rest
 
 ## Next action
 
-Continue Phase 4 (Web UI): advanced mode (policy editor, bandwidth, replication, key rotation, audit log, CLI console) and Playwright E2E tests.
+Phase 4's core flows are done (scaffold, simple mode, WebSocket progress, advanced mode). Remaining: Playwright E2E tests for add host → run backup → restore.
 
 ## Session log
 
 _(newest first — append one short entry per work session; do not delete old entries)_
+
+- **2026-09-23 (3)** — Advanced mode web screens (committed this session): new server routes `GET /api/audit` (audit log, newest-first, 200 entries) and `POST /api/hosts/{id}/key` (SSH key rotation via `set_host_key`, audited as `host.key_rotate`); `aegis-web/src/advanced.tsx` tabbed section — policy editor (name/cron/paths/retention/bandwidth + list/remove), audit log viewer (time/action/detail/user), key rotation form (host picker + PEM, with hint that the public half must be in authorized_keys). `advanced_api` integration tests cover audit listing, key rotation round-trip (decrypted via master key), 404 on unknown host, and audit entries. 135 tests, clippy/fmt green.
 
 - **2026-09-23 (2)** — WebSocket live job progress (committed this session): `aegis-server/src/jobs.rs` gained an `EventHub` (broadcast of `JobEvent` started/completed/failed with byte counts) published by the worker pool around each run; `GET /api/jobs/ws` upgrades to a WebSocket streaming those events, authenticating via `?token=` (browsers can't set headers on upgrades — the bearer middleware now accepts the query param too); `aegis-web` subscribes and shows live event banners + refreshes the dashboard on every event. `jobs_ws` integration test (token rejection, real upgrade over a socket, frame delivery). 133 tests, clippy/fmt green.
 

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import Advanced from './advanced'
 import {
   ApiError,
   addHost,
@@ -307,6 +308,8 @@ function Dashboard({ user, onLogout }: { user: Me; onLogout: () => void }) {
       </section>
 
       <RestoreBrowser hosts={hosts} />
+
+      <Advanced hosts={hosts} />
 
       <section className="space-y-3">
         <h2 className="font-semibold">Recent jobs</h2>
