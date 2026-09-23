@@ -49,11 +49,13 @@ This session also fixed a real bug found by the property suite on Windows: `rest
 
 ## Next action
 
-Phase 4's core flows are done (scaffold, simple mode, WebSocket progress, advanced mode). Remaining: Playwright E2E tests for add host → run backup → restore.
+Phase 4 is complete. Continue with Phase 5 (Agent Mode + Desktop Apps) or Phase 6 (MCP server) per ROADMAP.
 
 ## Session log
 
 _(newest first — append one short entry per work session; do not delete old entries)_
+
+- **2026-09-23 (4)** — Playwright E2E tests (committed this session): `crates/aegis-web/e2e/core-flows.spec.ts` — login → add host → run backup → live WS progress banner, plus a bad-credentials test; uses the system Chrome (`channel: chrome`) so no browser download is needed (playwright CDN is geo-blocked here). New `scripts/e2e-harness.sh` + `aegis-e2e-sshd` binary (fixed-port variant of the in-process SSH harness via `spawn_sftp_server_on`): boots sshd on :2222, seeds a repo, admin user, and e2e host, then runs `aegis-server` on :8080. CI gains an `e2e` job wiring harness + Playwright together. Playwright deps are dev-only; `russh-sftp`/`tempfile` moved to regular deps of aegis-server for the sshd binary. Suite 135 tests, clippy/fmt green, 2/2 E2E passing.
 
 - **2026-09-23 (3)** — Advanced mode web screens (committed this session): new server routes `GET /api/audit` (audit log, newest-first, 200 entries) and `POST /api/hosts/{id}/key` (SSH key rotation via `set_host_key`, audited as `host.key_rotate`); `aegis-web/src/advanced.tsx` tabbed section — policy editor (name/cron/paths/retention/bandwidth + list/remove), audit log viewer (time/action/detail/user), key rotation form (host picker + PEM, with hint that the public half must be in authorized_keys). `advanced_api` integration tests cover audit listing, key rotation round-trip (decrypted via master key), 404 on unknown host, and audit entries. 135 tests, clippy/fmt green.
 

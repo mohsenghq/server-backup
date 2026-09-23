@@ -80,3 +80,40 @@ jobs:
       - run: cargo test -p aegis-core --test real_sshd
         env:
           AEGIS_DOCKER_TESTS: "1"
+
+  # Phase 4: Playwright E2E over the real server + real UI. A test binary
+  # harness boots an aegis-server against the in-process SSH server and
+  # seeds an admin; Playwright then drives the browser through the flows.
+  e2e:
+    name: e2e (playwright)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: e2e
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Build server + seed harness
+        run: cargo build -p aegis-server -p aegis-cli
+      - name: Start aegis-server with an in-process SSH target
+        run: |
+          ./scripts/e2e-harness.sh &
+          sleep 5
+        env:
+          AEGIS_PASSPHRASE: e2e-passphrase
+      - name: Run Playwright
+        working-directory: crates/aegis-web
+        run: |
+          npm ci || npm install
+          npx playwright install chromium --with-deps || npx playwright install chromium
+          npx playwright test
+        env:
+          CI: "1"
+          AEGIS_E2E_API: http://127.0.0.1:8080
+          AEGIS_E2E_SSH_PORT: 2222
+          AEGIS_E2E_SSH_USER: aegis
+          AEGIS_E2E_PATHS: /srv/backup-me
+          AEGIS_E2E_REPO: /tmp/aegis-e2e-repo

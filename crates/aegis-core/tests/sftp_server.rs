@@ -27,9 +27,14 @@ pub const PASSWORD: &str = "test-passphrase";
 
 /// Spawn the server on a free port, serving `root`, and return the port.
 pub async fn spawn_sftp_server(root: PathBuf) -> Result<u16> {
+    spawn_sftp_server_on("127.0.0.1:0", root).await
+}
+
+/// Spawn the server on an explicit address (e.g. a fixed E2E port).
+pub async fn spawn_sftp_server_on(addr: &str, root: PathBuf) -> Result<u16> {
     let host_key = russh::keys::decode_secret_key(HOST_KEY, None)
         .map_err(|e| Error::Ssh(format!("decoding test host key: {e}")))?;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+    let listener = tokio::net::TcpListener::bind(addr)
         .await
         .map_err(|e| Error::Ssh(format!("binding test server: {e}")))?;
     let port = listener
