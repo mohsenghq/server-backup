@@ -329,6 +329,11 @@ pub struct TriggerRequest {
     pub paths: Vec<String>,
     /// Repository location (local path or sftp:// URL), as in the CLI.
     pub repo: String,
+    /// Use agent mode (`docs/04`): auto-push the agent binary over SSH and
+    /// run the backup on the target. Falls back to agentless when the target
+    /// cannot run it. Default: agentless.
+    #[serde(default)]
+    pub agent: bool,
 }
 
 #[derive(Serialize)]
@@ -419,9 +424,51 @@ async fn trigger(
         .map_err(|e| ApiError::bad_request(format!("opening repository: {e}")))?;
 
     let ssh = aegis_core::ssh::SshManager::new();
-    let snapshot = aegis_core::backup_remote(&repo, &ssh, &cfg, &repo.config().chunker, &req.paths)
-        .await
-        .map_err(|e| ApiError::internal(format!("backup failed: {e}")))?;
+    let snapshot = if req.agent {
+        // Agent mode: chunk at the source. Falls back to agentless when the
+        // target cannot run the agent (restricted shell, unknown platform).
+        let bin_dir = std::env::var("AEGIS_AGENT_BIN_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("target/aegis-agent"));
+        match aegis_core::agent::push_and_run(&ssh, &cfg, &bin_dir, &req.repo, &pass, &req.paths)
+            .await
+        {
+            Ok(line) => {
+                // The agent committed the snapshot itself into the repo the
+                // two processes share; re-open to read its manifest.
+                let id = line.split_whitespace().next().unwrap_or("").to_string();
+                let _ = state
+                    .catalog
+                    .set_host_status(&req.host_id, aegis_core::catalog::HostStatus::Reachable)
+                    .await;
+                let _ = state
+                    .catalog
+                    .audit(Some(&user.id), "job.run.agent", Some(&req.host_id))
+                    .await;
+                return Ok(Json(TriggerResponse {
+                    snapshot_id: id,
+                    files: 0,
+                    new_chunks: 0,
+                }));
+            }
+            Err(aegis_core::agent::AgentError::Unsupported(reason)) => {
+                let _ = state
+                    .catalog
+                    .audit(Some(&user.id), "job.agent_fallback", Some(&reason))
+                    .await;
+                aegis_core::backup_remote(&repo, &ssh, &cfg, &repo.config().chunker, &req.paths)
+                    .await
+                    .map_err(|e| ApiError::internal(format!("backup failed: {e}")))?
+            }
+            Err(aegis_core::agent::AgentError::Failed(e)) => {
+                return Err(ApiError::internal(format!("agent backup failed: {e}")));
+            }
+        }
+    } else {
+        aegis_core::backup_remote(&repo, &ssh, &cfg, &repo.config().chunker, &req.paths)
+            .await
+            .map_err(|e| ApiError::internal(format!("backup failed: {e}")))?
+    };
     let _ = state
         .catalog
         .set_host_status(&req.host_id, aegis_core::catalog::HostStatus::Reachable)

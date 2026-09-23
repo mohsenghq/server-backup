@@ -1,6 +1,6 @@
 [package]
 name = "aegis-agent"
-description = "Aegis on-host agent: source-side chunking and hashing. Not yet implemented (Phase 5)."
+description = "Aegis on-host agent: source-side chunking and hashing."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,3 +8,10 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+aegis-core.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+
+[[bin]]
+name = "aegis-agent"
+path = "src/main.rs"

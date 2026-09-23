@@ -49,11 +49,13 @@ This session also fixed a real bug found by the property suite on Windows: `rest
 
 ## Next action
 
-Phase 4 is complete. Continue with Phase 5 (Agent Mode + Desktop Apps) or Phase 6 (MCP server) per ROADMAP.
+Phase 5 agent auto-push done. Next: agent lifecycle management from the server (install/persist/upgrade), then the Tauri desktop shell.
 
 ## Session log
 
 _(newest first — append one short entry per work session; do not delete old entries)_
+
+- **2026-09-23 (5)** — Phase 5 agent mode started (committed this session): `aegis-core::agent` — `backup_local_into` (source-side chunking into a local or sftp repo, auto-init on first use) and `push_and_run` (uname platform detection, SFTP upload of the matching `aegis-agent-<os>-<arch>` binary, remote `--once` invocation, /tmp cleanup, snapshot-id extraction, `AgentError::Unsupported` for agentless fallback); the real `aegis-agent` binary replaces the stub (`--once --repo … --path …`); `POST /api/jobs/trigger` gained `agent: true` with transparent agentless fallback and audit entries. `agent_mode` integration tests (local + sftp repo, dedup, verify, restore). 140 tests, clippy/fmt green.
 
 - **2026-09-23 (4)** — Playwright E2E tests (committed this session): `crates/aegis-web/e2e/core-flows.spec.ts` — login → add host → run backup → live WS progress banner, plus a bad-credentials test; uses the system Chrome (`channel: chrome`) so no browser download is needed (playwright CDN is geo-blocked here). New `scripts/e2e-harness.sh` + `aegis-e2e-sshd` binary (fixed-port variant of the in-process SSH harness via `spawn_sftp_server_on`): boots sshd on :2222, seeds a repo, admin user, and e2e host, then runs `aegis-server` on :8080. CI gains an `e2e` job wiring harness + Playwright together. Playwright deps are dev-only; `russh-sftp`/`tempfile` moved to regular deps of aegis-server for the sshd binary. Suite 135 tests, clippy/fmt green, 2/2 E2E passing.
 

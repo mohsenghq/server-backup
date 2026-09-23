@@ -19,6 +19,7 @@
 
 #![warn(missing_docs)]
 
+pub mod agent;
 pub mod agentless;
 pub mod backend;
 pub mod blobs;

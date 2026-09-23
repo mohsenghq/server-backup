@@ -52,7 +52,7 @@ Static plan — what "done" means for each phase. Work top to bottom, in order. 
 
 ## Phase 5 — Agent Mode + Desktop Apps
 
-- [ ] Auto-push/install of `aegis-agent` over an existing SSH session
+- [x] Auto-push/install of `aegis-agent` over an existing SSH session
 - [ ] Agent lifecycle management from the server (start/stop/upgrade)
 - [ ] Tauri v2 shell around `aegis-web` (Windows + Linux)
 - [ ] Local sidecar bundling of `aegis-server` in the desktop app

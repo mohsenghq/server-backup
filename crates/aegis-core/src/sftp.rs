@@ -22,7 +22,7 @@
 //! `AcceptAny` skips the check for ephemeral test environments. The default
 //! is `Strict`; `AEGIS_KNOWN_HOSTS` relocates the file.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use russh::client;
@@ -152,6 +152,30 @@ pub enum SftpAuth {
     Key(Arc<PrivateKey>),
 }
 
+impl SftpAuth {
+    /// The agent's default auth: the user's default key file
+    /// (`~/.ssh/id_ed25519` / `id_rsa`), the standard non-interactive path.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidInput`] when no default key file exists.
+    pub fn from_env() -> Result<Self> {
+        for name in ["id_ed25519", "id_rsa"] {
+            if let Some(home) = std::env::var_os("HOME") {
+                let path = Path::new(&home).join(".ssh").join(name);
+                if path.exists() {
+                    return Ok(Self::KeyFile {
+                        path,
+                        key_passphrase: None,
+                    });
+                }
+            }
+        }
+        Err(Error::InvalidInput(
+            "no default SSH key (~/.ssh/id_ed25519 or id_rsa) found".into(),
+        ))
+    }
+}
 impl std::fmt::Debug for SftpAuth {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
