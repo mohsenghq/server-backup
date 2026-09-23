@@ -104,13 +104,7 @@ pub async fn push_and_run(
 ) -> std::result::Result<String, AgentError> {
     // 1. Detect the target OS/arch (`uname` covers Linux/macOS; for Windows
     //    targets the agent path is out of scope for now).
-    let uname = ssh
-        .exec_check(host, "uname -s -m")
-        .await
-        .map_err(|e| AgentError::Unsupported(format!("uname: {e}")))?;
-    let uname_out = String::from_utf8_lossy(&uname.stdout).trim().to_string();
-    let platform = platform_of(&uname_out)
-        .ok_or_else(|| AgentError::Unsupported(format!("unknown platform: {uname_out}")))?;
+    let platform = detect_platform(ssh, host).await?;
 
     // 2. Upload the matching binary to a temp path.
     let local_bin = agent_bin_dir.join(format!("aegis-agent-{platform}"));
@@ -172,6 +166,165 @@ pub async fn push_and_run(
         .ok_or_else(|| AgentError::Failed(format!("agent printed no snapshot id: {stdout}")))
 }
 
+/// Where a persistently-installed agent lives on the target.
+pub const AGENT_INSTALL_PATH: &str = "/usr/local/bin/aegis-agent";
+/// The systemd unit the installer writes.
+pub const AGENT_UNIT_NAME: &str = "aegis-agent.service";
+
+/// Persistently install (or upgrade) the agent on the target: upload the
+/// platform binary to [`AGENT_INSTALL_PATH`], write a systemd unit running
+/// `aegis-agent --once --repo <repo>` on the given cron schedule via a
+/// systemd timer, and enable it. Re-running upgrades in place.
+///
+/// Returns the remote `systemctl is-enabled` output on success.
+///
+/// # Errors
+///
+/// [`AgentError::Unsupported`] when the platform is unknown or the binary
+/// for it is missing; [`AgentError::Failed`] for remote failures.
+pub async fn install(
+    ssh: &SshManager,
+    host: &crate::ssh::HostConfig,
+    agent_bin_dir: &Path,
+    repo_location: &str,
+    passphrase: &str,
+    on_calendar: &str,
+) -> std::result::Result<String, AgentError> {
+    let platform = detect_platform(ssh, host).await?;
+    let local_bin = agent_bin_dir.join(format!("aegis-agent-{platform}"));
+    let bytes = std::fs::read(&local_bin).map_err(|e| {
+        AgentError::Unsupported(format!(
+            "no agent binary for {platform} at {}: {e}",
+            local_bin.display()
+        ))
+    })?;
+
+    // Install path requires root; if the SSH user isn't root, use sudo.
+    let sudo = if host.user == "root" { "" } else { "sudo " };
+    upload(ssh, host, "/tmp/aegis-agent-install", &bytes).await?;
+    ssh.exec_check(host, &format!("{sudo}chmod 755 /tmp/aegis-agent-install"))
+        .await
+        .map_err(|e| AgentError::Failed(format!("chmod: {e}")))?;
+    ssh.exec_check(
+        host,
+        &format!(
+            "{sudo}mv /tmp/aegis-agent-install {}",
+            shell_quote(AGENT_INSTALL_PATH)
+        ),
+    )
+    .await
+    .map_err(|e| AgentError::Failed(format!("install: {e}")))?;
+
+    // The systemd service + timer. The passphrase is passed through an
+    // EnvironmentFile so it isn't visible in `ps` output on the target.
+    let unit = format!(
+        "[Unit]\nDescription=Aegis agent backup\nWants=network-online.target\nAfter=network-online.target\n\
+         [Service]\nType=oneshot\nExecStart={} --once --repo {}\nTimeoutStartSec=2h",
+        AGENT_INSTALL_PATH,
+        shell_quote(repo_location)
+    );
+    let env_file = format!("AEGIS_PASSPHRASE={passphrase}\n");
+    let timer = format!(
+        "[Unit]\nDescription=Aegis agent schedule\n\
+         [Timer]\nOnCalendar={}\nPersistent=true\n\
+         [Install]\nWantedBy=timers.target",
+        on_calendar
+    );
+
+    for (path, content) in [
+        ("/tmp/aegis-agent.env", env_file),
+        ("/tmp/aegis-agent.service", unit),
+        ("/tmp/aegis-agent.timer", timer),
+    ] {
+        upload(ssh, host, path, content.as_bytes()).await?;
+    }
+    let script = format!(
+        "{sudo}mv /tmp/aegis-agent.service /etc/systemd/system/{AGENT_UNIT_NAME} && \
+         {sudo}mv /tmp/aegis-agent.timer /etc/systemd/system/aegis-agent.timer && \
+         {sudo}mv /tmp/aegis-agent.env /etc/aegis-agent.env && \
+         {sudo}systemctl daemon-reload && \
+         {sudo}systemctl enable --now aegis-agent.timer"
+    );
+    ssh.exec_check(host, &script)
+        .await
+        .map_err(|e| AgentError::Failed(format!("systemd setup: {e}")))?;
+
+    let status = ssh
+        .exec(
+            host,
+            &format!("{sudo}systemctl is-enabled aegis-agent.timer"),
+        )
+        .await
+        .map_err(|e| AgentError::Failed(format!("status: {e}")))?;
+    Ok(String::from_utf8_lossy(&status.stdout).trim().to_string())
+}
+
+/// Ask the target whether a persistent agent is installed and which version
+/// it runs. Returns `(installed, version_output)`.
+///
+/// # Errors
+///
+/// [`AgentError::Failed`] for transport failures.
+pub async fn status(
+    ssh: &SshManager,
+    host: &crate::ssh::HostConfig,
+) -> std::result::Result<(bool, String), AgentError> {
+    let out = ssh
+        .exec(
+            host,
+            &format!(
+                "test -x {} && {} --version || echo not-installed",
+                shell_quote(AGENT_INSTALL_PATH),
+                shell_quote(AGENT_INSTALL_PATH)
+            ),
+        )
+        .await
+        .map_err(|e| AgentError::Failed(format!("status: {e}")))?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let installed = !text.is_empty() && text != "not-installed" && out.success();
+    Ok((installed, text))
+}
+
+/// Upgrade an installed agent to the binary from `agent_bin_dir`: replace
+/// [`AGENT_INSTALL_PATH`] and restart the timer. Works even when nothing was
+/// installed before (it just installs).
+///
+/// # Errors
+///
+/// Same as [`install`].
+pub async fn upgrade(
+    ssh: &SshManager,
+    host: &crate::ssh::HostConfig,
+    agent_bin_dir: &Path,
+    repo_location: &str,
+    passphrase: &str,
+    on_calendar: &str,
+) -> std::result::Result<String, AgentError> {
+    install(
+        ssh,
+        host,
+        agent_bin_dir,
+        repo_location,
+        passphrase,
+        on_calendar,
+    )
+    .await
+}
+
+/// Detect the target platform over SSH (`uname -s -m`).
+async fn detect_platform(
+    ssh: &SshManager,
+    host: &crate::ssh::HostConfig,
+) -> std::result::Result<&'static str, AgentError> {
+    let uname = ssh
+        .exec_check(host, "uname -s -m")
+        .await
+        .map_err(|e| AgentError::Unsupported(format!("uname: {e}")))?;
+    let uname_out = String::from_utf8_lossy(&uname.stdout).trim().to_string();
+    platform_of(&uname_out)
+        .ok_or_else(|| AgentError::Unsupported(format!("unknown platform: {uname_out}")))
+}
+
 /// Map `uname -s -m` output to the platform tag used for agent binaries.
 fn platform_of(uname: &str) -> Option<&'static str> {
     let mut parts = uname.split_whitespace();
@@ -213,7 +366,7 @@ async fn upload(
 }
 
 /// Quote a string for POSIX shell consumption.
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 

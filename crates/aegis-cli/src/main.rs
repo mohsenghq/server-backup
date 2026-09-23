@@ -16,7 +16,7 @@ mod users;
 
 use aegis_core::backend::Backend;
 use aegis_core::sftp::{HostKeyPolicy, RepoLocation, SftpAuth, SftpBackend};
-use aegis_core::{ChunkerConfig, LocalBackend, PassphraseSource, Repository};
+use aegis_core::{ChunkerConfig, LocalBackend, PassphraseSource, Repository, SshManager};
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
 
@@ -263,6 +263,78 @@ enum HostCommand {
         /// Maximum hosts backed up at the same time.
         #[arg(long, value_name = "N", default_value_t = 8)]
         concurrency: usize,
+    },
+
+    /// Install (or upgrade) the agent on a host as a persistent systemd
+    /// timer. The binary comes from `--agent-bin-dir` (CI artifacts).
+    AgentInstall {
+        /// Path to the catalog database.
+        #[arg(long, value_name = "FILE", default_value = "aegis-catalog.db")]
+        catalog: PathBuf,
+
+        /// The host's name or id (prefix ok).
+        #[arg(value_name = "HOST")]
+        host: String,
+
+        /// Repository the agent writes to (an `sftp://` URL reachable from
+        /// the target).
+        #[arg(long, value_name = "LOCATION")]
+        repo: String,
+
+        /// Directory holding `aegis-agent-<os>-<arch>` binaries.
+        #[arg(long, value_name = "DIR", default_value = "target/aegis-agent")]
+        agent_bin_dir: PathBuf,
+
+        /// systemd OnCalendar schedule for the timer.
+        #[arg(long, value_name = "CALENDAR", default_value = "*-*-* 03:00:00")]
+        on_calendar: String,
+
+        /// Accept any host key (ephemeral test environments only).
+        #[arg(long)]
+        insecure: bool,
+    },
+
+    /// Report whether the persistent agent is installed on a host.
+    AgentStatus {
+        /// Path to the catalog database.
+        #[arg(long, value_name = "FILE", default_value = "aegis-catalog.db")]
+        catalog: PathBuf,
+
+        /// The host's name or id (prefix ok).
+        #[arg(value_name = "HOST")]
+        host: String,
+
+        /// Accept any host key (ephemeral test environments only).
+        #[arg(long)]
+        insecure: bool,
+    },
+
+    /// Upgrade the persistent agent on a host (re-runs the installer with
+    /// the current binary). Reuse of the installer makes upgrades atomic.
+    AgentUpgrade {
+        /// Path to the catalog database.
+        #[arg(long, value_name = "FILE", default_value = "aegis-catalog.db")]
+        catalog: PathBuf,
+
+        /// The host's name or id (prefix ok).
+        #[arg(value_name = "HOST")]
+        host: String,
+
+        /// Repository the agent writes to.
+        #[arg(long, value_name = "LOCATION")]
+        repo: String,
+
+        /// Directory holding `aegis-agent-<os>-<arch>` binaries.
+        #[arg(long, value_name = "DIR", default_value = "target/aegis-agent")]
+        agent_bin_dir: PathBuf,
+
+        /// systemd OnCalendar schedule for the timer.
+        #[arg(long, value_name = "CALENDAR", default_value = "*-*-* 03:00:00")]
+        on_calendar: String,
+
+        /// Accept any host key (ephemeral test environments only).
+        #[arg(long)]
+        insecure: bool,
     },
 }
 
@@ -667,6 +739,104 @@ async fn main() -> Result<()> {
                     if !failed.is_empty() {
                         std::process::exit(2);
                     }
+                },
+            );
+        }
+        Command::Host(HostCommand::AgentInstall { .. })
+        | Command::Host(HostCommand::AgentUpgrade { .. }) => {
+            let is_upgrade = matches!(cli.command, Command::Host(HostCommand::AgentUpgrade { .. }));
+            // Both subcommands share identical fields except the leading enum
+            // name; destructure generically via a helper closure on references.
+            let (catalog, host, repo, agent_bin_dir, on_calendar, insecure) = match &cli.command {
+                Command::Host(HostCommand::AgentInstall {
+                    catalog,
+                    host,
+                    repo,
+                    agent_bin_dir,
+                    on_calendar,
+                    insecure,
+                    ..
+                })
+                | Command::Host(HostCommand::AgentUpgrade {
+                    catalog,
+                    host,
+                    repo,
+                    agent_bin_dir,
+                    on_calendar,
+                    insecure,
+                    ..
+                }) => (
+                    catalog.clone(),
+                    host.clone(),
+                    repo.clone(),
+                    agent_bin_dir.clone(),
+                    on_calendar.clone(),
+                    *insecure,
+                ),
+                _ => unreachable!(),
+            };
+            let handle = hosts::CatalogHandle::open(&catalog).await?;
+            let h = hosts::find_host(&handle, &host).await?;
+            let with_key = handle
+                .catalog
+                .get_host_with_key(&h.id, handle.master_key())
+                .await?;
+            let cfg = hosts::host_config(&with_key.host, &with_key.ssh_key_pem, insecure)?;
+            let pass = load_passphrase(PassphraseSource::default())?;
+            let ssh = SshManager::new();
+            let enabled = if is_upgrade {
+                aegis_core::agent::upgrade(&ssh, &cfg, &agent_bin_dir, &repo, &pass, &on_calendar)
+                    .await
+            } else {
+                aegis_core::agent::install(&ssh, &cfg, &agent_bin_dir, &repo, &pass, &on_calendar)
+                    .await
+            }
+            .map_err(|e| anyhow!("agent install failed: {e}"))?;
+            handle
+                .catalog
+                .audit(None, "host.agent_install", Some(&h.name))
+                .await
+                .ok();
+            emit(
+                cli.json,
+                &serde_json::json!({
+                    "host": h.name,
+                    "agent_path": aegis_core::agent::AGENT_INSTALL_PATH,
+                    "timer": aegis_core::agent::AGENT_UNIT_NAME,
+                    "enabled": enabled,
+                }),
+                || println!("agent installed on {} (timer {enabled})", h.name),
+            );
+        }
+
+        Command::Host(HostCommand::AgentStatus {
+            catalog,
+            host,
+            insecure,
+        }) => {
+            let handle = hosts::CatalogHandle::open(&catalog).await?;
+            let h = hosts::find_host(&handle, &host).await?;
+            let with_key = handle
+                .catalog
+                .get_host_with_key(&h.id, handle.master_key())
+                .await?;
+            let cfg = hosts::host_config(&with_key.host, &with_key.ssh_key_pem, insecure)?;
+            let (installed, version) = aegis_core::agent::status(&SshManager::new(), &cfg)
+                .await
+                .map_err(|e| anyhow!("agent status failed: {e}"))?;
+            emit(
+                cli.json,
+                &serde_json::json!({ "host": h.name, "installed": installed, "version": version }),
+                || {
+                    println!(
+                        "{}: agent {}",
+                        h.name,
+                        if installed {
+                            format!("installed ({version})")
+                        } else {
+                            "not installed".to_string()
+                        }
+                    );
                 },
             );
         }

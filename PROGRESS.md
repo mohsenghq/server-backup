@@ -49,11 +49,13 @@ This session also fixed a real bug found by the property suite on Windows: `rest
 
 ## Next action
 
-Phase 5 agent auto-push done. Next: agent lifecycle management from the server (install/persist/upgrade), then the Tauri desktop shell.
+Phase 5 agent auto-push and lifecycle management are done. Next: Tauri v2 desktop shell (Phase 5) or the MCP server (Phase 6) per ROADMAP.
 
 ## Session log
 
 _(newest first — append one short entry per work session; do not delete old entries)_
+
+- **2026-09-23 (6)** — Agent lifecycle management (committed this session): `aegis_core::agent::{install,status,upgrade}` — install uploads the platform binary to `/usr/local/bin/aegis-agent` (sudo when non-root), writes a systemd oneshot service + `OnCalendar` timer + EnvironmentFile (passphrase never in `ps`), enables the timer, and reports `systemctl is-enabled`; `status` asks the target via `test -x … && … --version`; `upgrade` re-runs the installer (idempotent). CLI: `aegis host agent-install/agent-status/agent-upgrade`. `agent_lifecycle` tests cover the Unsupported fallback path, status round-trip, and shell-quoting safety. 143 tests, clippy/fmt green.
 
 - **2026-09-23 (5)** — Phase 5 agent mode started (committed this session): `aegis-core::agent` — `backup_local_into` (source-side chunking into a local or sftp repo, auto-init on first use) and `push_and_run` (uname platform detection, SFTP upload of the matching `aegis-agent-<os>-<arch>` binary, remote `--once` invocation, /tmp cleanup, snapshot-id extraction, `AgentError::Unsupported` for agentless fallback); the real `aegis-agent` binary replaces the stub (`--once --repo … --path …`); `POST /api/jobs/trigger` gained `agent: true` with transparent agentless fallback and audit entries. `agent_mode` integration tests (local + sftp repo, dedup, verify, restore). 140 tests, clippy/fmt green.
 

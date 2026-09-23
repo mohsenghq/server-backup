@@ -20,6 +20,7 @@
 #![warn(missing_docs)]
 
 pub mod agent;
+pub mod agent_test_hooks;
 pub mod agentless;
 pub mod backend;
 pub mod blobs;
