@@ -44,8 +44,8 @@ Static plan — what "done" means for each phase. Work top to bottom, in order. 
 
 ## Phase 4 — Web UI
 
-- [ ] React app scaffold (Vite, TypeScript, Tailwind, shadcn/ui)
-- [ ] Simple mode: dashboard, add-host wizard, restore browser
+- [x] React app scaffold (Vite, TypeScript, Tailwind, shadcn/ui)
+- [x] Simple mode: dashboard, add-host wizard, restore browser
 - [ ] Advanced mode: raw policy editor, bandwidth throttling, replication config, key rotation, audit log, embedded CLI console
 - [ ] WebSocket live job progress
 - [ ] Playwright E2E tests for the core flows (add host → run backup → restore a file)

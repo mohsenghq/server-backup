@@ -1,0 +1,10 @@
+@import "tailwindcss";
+@import "./forms.css";
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  @apply bg-neutral-950 text-neutral-100;
+}

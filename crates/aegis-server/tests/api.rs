@@ -376,7 +376,9 @@ async fn trigger_runs_agentless_backup() {
     let bound = listener.local_addr().unwrap();
     drop(listener);
     let server =
-        tokio::spawn(async move { aegis_server::serve(bound, dir.path().join("serve.db")).await });
+        tokio::spawn(
+            async move { aegis_server::serve(bound, dir.path().join("serve.db"), None).await },
+        );
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
     let resp = reqwest_free(bound).await;
     assert!(resp.contains("ok"), "health via serve(): {resp}");

@@ -49,11 +49,13 @@ This session also fixed a real bug found by the property suite on Windows: `rest
 
 ## Next action
 
-Phase 3 is complete. Continue with Phase 4 (Web UI) or Phase 5 (Agent Mode + Desktop Apps) per ROADMAP.
+Continue Phase 4 (Web UI): WebSocket live job progress, advanced mode (policy editor, bandwidth, replication, key rotation, audit log, CLI console), Playwright E2E tests. The remaining Phase 3/4 plumbing note: `AEGIS_WEB_DIST` (or a sibling `aegis-web/dist`) makes `aegis-server` serve the UI.
 
 ## Session log
 
 _(newest first — append one short entry per work session; do not delete old entries)_
+
+- **2026-09-23** — Phase 4 web UI started (committed this session): `crates/aegis-web` React+Vite+TS+Tailwind app (login, host dashboard with add-host wizard, backup trigger, jobs table) talking to the real API with bearer sessions; `aegis-server` now serves the built bundle at `/` via `AEGIS_WEB_DIST` with SPA fallback (`tower-http` ServeDir, `/api`+`/health` take precedence); `web_ui` integration test (static assets, SPA fallback, API precedence); CI builds the web bundle in the test job. 131 tests, clippy/fmt green.
 
 - **2026-09-18** — Phase 3 scheduler + policy CRUD committed (87131f8): `aegis-core::catalog` Policy struct + CRUD methods; `aegis-server/src/scheduler.rs` tokio-cron-scheduler; `aegis-cli/src/policy.rs` `aegis policy add/list/remove`; API routes `GET/POST /api/policies`, `DELETE /api/policies/{id}`; policy_crud integration test; workspace clippy/fmt/tests green. Committed locally (push pending).
 
