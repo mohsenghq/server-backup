@@ -34,6 +34,7 @@ pub async fn serve(
         app_state.catalog.clone(),
         *app_state.master_key(),
         catalog_path.clone(),
+        app_state.events.clone(),
     )
     .await?;
     let app = api::router(app_state);

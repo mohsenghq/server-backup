@@ -23,6 +23,7 @@ pub async fn start(
     catalog: Catalog,
     master_key: [u8; 32],
     catalog_path: PathBuf,
+    events: jobs::EventHub,
 ) -> Result<SchedulerHandle> {
     let queue = jobs::start(
         Arc::new(catalog.clone()),
@@ -32,6 +33,7 @@ pub async fn start(
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(4),
+        events,
     )
     .await?;
     let scheduler = JobScheduler::new().await?;

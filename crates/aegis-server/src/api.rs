@@ -1,7 +1,10 @@
 //! The REST API (`docs/06-api-spec.md`). Each endpoint maps to a CLI command.
 
 use axum::{
-    extract::{Path as UrlPath, State},
+    extract::{
+        ws::{WebSocket, WebSocketUpgrade},
+        Path as UrlPath, State,
+    },
     http::StatusCode,
     middleware,
     response::IntoResponse,
@@ -27,6 +30,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/hosts/{id}", delete(remove_host))
         .route("/api/hosts/{id}/test", post(test_host))
         .route("/api/jobs", get(list_jobs))
+        .route("/api/jobs/ws", get(jobs_ws))
         .route("/api/jobs/trigger", post(trigger))
         .route("/api/policies", get(list_policies).post(add_policy))
         .route("/api/policies/{id}", delete(remove_policy))
@@ -46,15 +50,27 @@ async fn require_session(
     mut request: axum::extract::Request,
     next: middleware::Next,
 ) -> Result<axum::response::Response, ApiError> {
-    let header = request
+    let token = if let Some(header) = request
         .headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
-    let token = header.ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
+        .and_then(|value| value.strip_prefix("Bearer "))
+    {
+        Some(header.to_string())
+    } else {
+        // WebSocket clients can't set headers on the upgrade request, so
+        // they authenticate with a `?token=` query parameter instead.
+        request.uri().query().and_then(|q| {
+            q.split('&').find_map(|pair| {
+                let (k, v) = pair.split_once('=')?;
+                (k == "token").then(|| v.to_string())
+            })
+        })
+    };
+    let token = token.ok_or_else(|| ApiError::unauthorized("missing bearer token"))?;
     let user = state
         .catalog
-        .session_user(token)
+        .session_user(&token)
         .await
         .map_err(|_| ApiError::unauthorized("invalid or expired session"))?;
     request.extensions_mut().insert(user);
@@ -377,6 +393,57 @@ async fn trigger(
         files: snapshot.stats.files,
         new_chunks: snapshot.stats.new_chunks,
     }))
+}
+
+/// `GET /api/jobs/ws` — live job events over WebSocket (same auth model as
+/// the REST API: the bearer token must be supplied as a `token` query
+/// parameter, since browsers cannot set headers on WebSocket upgrades).
+async fn jobs_ws(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    upgrade: WebSocketUpgrade,
+) -> Result<axum::response::Response, ApiError> {
+    let token = params
+        .get("token")
+        .ok_or_else(|| ApiError::unauthorized("missing token parameter"))?;
+    state
+        .catalog
+        .session_user(token)
+        .await
+        .map_err(|_| ApiError::unauthorized("invalid or expired session"))?;
+    Ok(upgrade.on_upgrade(move |socket| jobs_ws_socket(State(state), socket)))
+}
+
+/// Stream [`JobEvent`]s to a connected client until it disconnects.
+async fn jobs_ws_socket(State(state): State<AppState>, mut socket: WebSocket) {
+    let mut rx = state.events.subscribe();
+    loop {
+        match rx.recv().await {
+            Ok(event) => {
+                let text = match serde_json::to_string(&event) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                if socket
+                    .send(axum::extract::ws::Message::text(text))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+        // Interleave pings so idle connections survive proxies.
+        if socket
+            .send(axum::extract::ws::Message::Ping(axum::body::Bytes::new()))
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
 }
 
 /// `GET /api/jobs` ⇔ `aegis job list`.

@@ -6,11 +6,15 @@ use aegis_core::catalog::Catalog;
 use aegis_core::keys::{KeyFile, RepoCrypto};
 use anyhow::{anyhow, Context, Result};
 
+use crate::jobs::EventHub;
+
 /// The catalog plus its unwrapped master key, shared across handlers.
 #[derive(Clone)]
 pub struct AppState {
     /// The open catalog.
     pub catalog: Catalog,
+    /// Live job events (WebSocket broadcast hub).
+    pub events: EventHub,
     master_key: [u8; 32],
 }
 
@@ -53,6 +57,7 @@ impl AppState {
         };
         Ok(Self {
             catalog,
+            events: EventHub::default(),
             master_key,
         })
     }

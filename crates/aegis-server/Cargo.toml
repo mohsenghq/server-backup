@@ -34,3 +34,7 @@ tempfile.workspace = true
 tower = { version = "0.5", features = ["util"] }
 russh-sftp.workspace = true
 uuid.workspace = true
+futures-util = "0.3"
+tokio-tungstenite = "0.24"
+hyper = { version = "1", default-features = false, features = ["http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }

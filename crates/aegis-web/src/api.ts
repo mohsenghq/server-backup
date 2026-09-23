@@ -105,3 +105,29 @@ export const triggerBackup = (host_id: string, paths: string[], repo: string) =>
     method: 'POST',
     body: JSON.stringify({ host_id, paths, repo }),
   })
+
+export interface JobEvent {
+  event: 'started' | 'completed' | 'failed'
+  job_id: string
+  host_id: string
+  policy_id: string
+  bytes_new?: number
+  bytes_total?: number
+  error?: string
+}
+
+/// Subscribe to live job events over WebSocket. The bearer token is passed
+/// as a query parameter (browsers can't set headers on WS upgrades).
+export function subscribeJobs(onEvent: (e: JobEvent) => void): () => void {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  const token = getToken() ?? ''
+  const ws = new WebSocket(`${proto}://${location.host}/api/jobs/ws?token=${encodeURIComponent(token)}`)
+  ws.onmessage = (m) => {
+    try {
+      onEvent(JSON.parse(m.data) as JobEvent)
+    } catch {
+      // ignore malformed frames
+    }
+  }
+  return () => ws.close()
+}

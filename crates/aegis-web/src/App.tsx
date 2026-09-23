@@ -9,10 +9,12 @@ import {
   logout,
   me,
   removeHost,
+  subscribeJobs,
   testHost,
   triggerBackup,
   type Host,
   type Job,
+  type JobEvent,
   type Me,
 } from './api'
 
@@ -213,6 +215,7 @@ function Dashboard({ user, onLogout }: { user: Me; onLogout: () => void }) {
   const [hosts, setHosts] = useState<Host[]>([])
   const [jobs, setJobs] = useState<Job[]>([])
   const [error, setError] = useState<string | null>(null)
+  const [live, setLive] = useState<JobEvent | null>(null)
 
   const refresh = async () => {
     try {
@@ -224,6 +227,15 @@ function Dashboard({ user, onLogout }: { user: Me; onLogout: () => void }) {
   }
 
   useEffect(() => { refresh() }, [])
+
+  // Live job events: on each event, flash a toast and refresh the tables.
+  useEffect(() => {
+    return subscribeJobs((e) => {
+      setLive(e)
+      setTimeout(() => setLive((cur) => (cur === e ? null : cur)), 6000)
+      refresh()
+    })
+  }, [])
 
   const doTest = async (id: string) => {
     try { await testHost(id); refresh() } catch (err) { setError(String(err)) }
@@ -245,6 +257,22 @@ function Dashboard({ user, onLogout }: { user: Me; onLogout: () => void }) {
       </header>
 
       {error && <p className="rounded bg-red-950 p-3 text-sm text-red-300">{error}</p>}
+
+      {live && (
+        <div
+          className={`rounded p-3 text-sm ${
+            live.event === 'failed'
+              ? 'bg-red-950 text-red-300'
+              : live.event === 'completed'
+                ? 'bg-green-950 text-green-300'
+                : 'bg-yellow-950 text-yellow-300'
+          }`}
+        >
+          Job {live.event}
+          {live.event === 'failed' && live.error ? `: ${live.error}` : ''}
+          {live.event === 'completed' && live.bytes_new != null ? ` — ${bytes(live.bytes_new)} new` : ''}
+        </div>
+      )}
 
       <section className="space-y-3">
         <div className="flex items-center justify-between">

@@ -49,11 +49,13 @@ This session also fixed a real bug found by the property suite on Windows: `rest
 
 ## Next action
 
-Continue Phase 4 (Web UI): WebSocket live job progress, advanced mode (policy editor, bandwidth, replication, key rotation, audit log, CLI console), Playwright E2E tests. The remaining Phase 3/4 plumbing note: `AEGIS_WEB_DIST` (or a sibling `aegis-web/dist`) makes `aegis-server` serve the UI.
+Continue Phase 4 (Web UI): advanced mode (policy editor, bandwidth, replication, key rotation, audit log, CLI console) and Playwright E2E tests.
 
 ## Session log
 
 _(newest first — append one short entry per work session; do not delete old entries)_
+
+- **2026-09-23 (2)** — WebSocket live job progress (committed this session): `aegis-server/src/jobs.rs` gained an `EventHub` (broadcast of `JobEvent` started/completed/failed with byte counts) published by the worker pool around each run; `GET /api/jobs/ws` upgrades to a WebSocket streaming those events, authenticating via `?token=` (browsers can't set headers on upgrades — the bearer middleware now accepts the query param too); `aegis-web` subscribes and shows live event banners + refreshes the dashboard on every event. `jobs_ws` integration test (token rejection, real upgrade over a socket, frame delivery). 133 tests, clippy/fmt green.
 
 - **2026-09-23** — Phase 4 web UI started (committed this session): `crates/aegis-web` React+Vite+TS+Tailwind app (login, host dashboard with add-host wizard, backup trigger, jobs table) talking to the real API with bearer sessions; `aegis-server` now serves the built bundle at `/` via `AEGIS_WEB_DIST` with SPA fallback (`tower-http` ServeDir, `/api`+`/health` take precedence); `web_ui` integration test (static assets, SPA fallback, API precedence); CI builds the web bundle in the test job. 131 tests, clippy/fmt green.
 
