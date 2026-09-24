@@ -1,6 +1,6 @@
 [package]
 name = "aegis-mcp"
-description = "Aegis MCP server, exposing the Aegis API as MCP tools. Not yet implemented (Phase 6)."
+description = "Aegis MCP server, exposing the Aegis API as MCP tools."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,3 +8,21 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+rmcp.workspace = true
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+rmcp = { workspace = true, features = ["client"] }
+
+[lib]
+name = "aegis_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "aegis-mcp"
+path = "src/main.rs"

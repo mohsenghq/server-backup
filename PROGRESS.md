@@ -12,7 +12,7 @@ This file is the single source of truth for "where are we." Read it first, every
 
 ## Current status
 
-The workspace builds, lints clean (`clippy -D warnings`, `fmt --check`), and 143 tests pass (76 unit incl. 16 auth + 22 backup/restore integration + 9 property + 5 SFTP + 5 SSH-manager + 3 agentless + 1 host-inventory + 1 real-sshd + 3 server-API + criterion bench + CLI).
+The workspace builds, lints clean (`clippy -D warnings`, `fmt --check`), and 146 tests pass (76 unit incl. 16 auth + 22 backup/restore integration + 9 property + 5 SFTP + 5 SSH-manager + 3 agentless + 1 host-inventory + 1 real-sshd + 3 server-API + criterion bench + CLI).
 
 New in Phase 2:
 
@@ -49,12 +49,13 @@ This session also fixed a real bug found by the property suite on Windows: `rest
 
 ## Next action
 
-Phase 5 (agent mode, lifecycle, Tauri desktop shell) is complete. Next: the MCP server (`aegis-mcp`, Phase 6) per ROADMAP.
+The aegis-mcp server (Phase 6 item 1) is done. Next Phase 6 items: multi-backend replication, key rotation/re-key flow, RBAC.
 
 ## Session log
 
 _(newest first — append one short entry per work session; do not delete old entries)_
 
+- **2026-09-24** — MCP server (Phase 6 item 1, committed this session): `aegis-mcp` implemented with `rmcp` 0.11 — stdio MCP server exposing the REST API as tools: list_hosts/add_host/remove_host, trigger_backup (with `agent` flag), list_jobs, list_snapshots, restore_path, get_storage_stats, list_recent_alerts. No business logic duplicated: `api.rs` is a thin reqwest client over the same API the web UI calls (`AEGIS_API_URL` default `http://127.0.0.1:8080`, bearer token from `AEGIS_API_TOKEN`). Library split (`src/lib.rs` + `server.rs`) so tests drive the server over `tokio::io::duplex` with rmcp's client handler: tools/list coverage of all 9 tools and an end-to-end `list_hosts` call against a stub axum backend, plus API-client transport-error tests. 146 tests, clippy/fmt green. Disk: the mingw target dir had ballooned to 45G (stale test exes/rcgu objects) and filled the G: drive mid-session — cleaned to ~7G (old rlibs, exes, incremental, .d/.o files); deleted exes rebuild on demand.
 - **2026-09-23 (7)** — Tauri v2 desktop shell (Phase 5 complete, committed this session): `crates/aegis-web/src-tauri` (package `aegis-desktop`) wraps `aegis-web` — `lib.rs` spawns the `aegis-server` sidecar binary (`binaries/aegis-server-<target-triple>.exe`, `externalBin` in tauri.conf.json) on an ephemeral port, waits for `/health`, then loads the web UI pointing at it; without a passphrase it runs UI-only against a stubbed backend. Capabilities grant `shell:allow-spawn` + sidecar execute. `scripts/build-desktop.sh` copies the release `aegis-server` binary to the sidecar name (host triple from `rustc -vV`), runs the Vite build, then `tauri build` (msi/appimage/deb). CI: test/clippy jobs now use `--exclude aegis-desktop` and a new matrix `desktop` job (ubuntu+windows, apt deps for webkit2gtk on Linux) builds the bundle and uploads installers as artifacts. Machine-local caveat: the local mingw toolchain cannot link the cdylib (`corrupt .drectve` linker warning); `cargo check` and lib tests pass, msvc CI unaffected. 143 tests, clippy/fmt green (both excluding aegis-desktop).
 
 - **2026-09-23 (6)** — Agent lifecycle management (committed this session): `aegis_core::agent::{install,status,upgrade}` — install uploads the platform binary to `/usr/local/bin/aegis-agent` (sudo when non-root), writes a systemd oneshot service + `OnCalendar` timer + EnvironmentFile (passphrase never in `ps`), enables the timer, and reports `systemctl is-enabled`; `status` asks the target via `test -x … && … --version`; `upgrade` re-runs the installer (idempotent). CLI: `aegis host agent-install/agent-status/agent-upgrade`. `agent_lifecycle` tests cover the Unsupported fallback path, status round-trip, and shell-quoting safety. 143 tests, clippy/fmt green.

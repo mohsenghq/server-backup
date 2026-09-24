@@ -59,7 +59,7 @@ Static plan — what "done" means for each phase. Work top to bottom, in order. 
 
 ## Phase 6 — MCP Server + Advanced Features
 
-- [ ] `aegis-mcp` server (`rmcp`), tools per `docs/09-mcp-server.md`
+- [x] `aegis-mcp` server (`rmcp`), tools per `docs/09-mcp-server.md`
 - [ ] Multi-backend replication
 - [ ] Key rotation / re-key flow
 - [ ] RBAC / multi-user roles
