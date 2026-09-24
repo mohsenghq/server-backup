@@ -29,6 +29,7 @@ pub mod chunk;
 pub mod crypto;
 pub mod error;
 pub mod keys;
+pub mod replication;
 pub mod repo;
 pub mod retention;
 pub mod sftp;
@@ -42,6 +43,7 @@ pub use catalog::{AuditEntry, BackupMode, Catalog, Host, HostStatus, HostWithKey
 pub use chunk::{Chunk, ChunkHash, ChunkerConfig};
 pub use error::{Error, Result};
 pub use keys::{AeadContext, KeyFile, PassphraseSource, RepoCrypto};
+pub use replication::{replicate, ReplicateMode, ReplicateStats};
 pub use repo::{RepoConfig, Repository, FORMAT_VERSION};
 pub use sftp::{parse_location, RepoLocation, SftpAuth};
 pub use snapshot::{BlobKind, BlobRef, Snapshot, SnapshotIndex, SnapshotStats};

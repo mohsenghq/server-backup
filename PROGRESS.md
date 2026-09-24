@@ -12,7 +12,7 @@ This file is the single source of truth for "where are we." Read it first, every
 
 ## Current status
 
-The workspace builds, lints clean (`clippy -D warnings`, `fmt --check`), and 151 tests pass (76 unit incl. 16 auth + 22 backup/restore integration + 9 property + 5 SFTP + 5 SSH-manager + 3 agentless + 1 host-inventory + 1 real-sshd + 3 server-API + criterion bench + CLI).
+The workspace builds, lints clean (`clippy -D warnings`, `fmt --check`), and 156 tests pass (76 unit incl. 16 auth + 22 backup/restore integration + 9 property + 5 SFTP + 5 SSH-manager + 3 agentless + 1 host-inventory + 1 real-sshd + 3 server-API + criterion bench + CLI).
 
 New in Phase 2:
 
@@ -49,11 +49,13 @@ This session also fixed a real bug found by the property suite on Windows: `rest
 
 ## Next action
 
-Phase 6 items done so far: MCP server, RBAC. Next: multi-backend replication, bandwidth throttling, audit log viewer polish, FUSE (stretch).
+Phase 6 items done so far: MCP server, RBAC, multi-backend replication. Next: bandwidth throttling, audit log viewer polish, FUSE (stretch), then Phase 7 hardening.
 
 ## Session log
 
 _(newest first — append one short entry per work session; do not delete old entries)_
+
+- **2026-09-24 (3)** — Multi-backend replication (Phase 6, committed this session): `aegis_core::replication` — object-level mirror of a repository onto a second `Backend` (local or sftp) without a passphrase on the target (objects are already encrypted at rest). `ReplicateMode::Mirror` copies every source key (`config`, `blobs/`, `snapshots/`, `index/`, `keys/`) missing on the target, so repeated runs transfer only the delta; `Repair` re-copies differing objects; a target whose `config` mismatches the source (different repository) is refused. CLI: `aegis replicate --repo <loc> --to <loc> [--repair]`. Tests: 4 unit tests (full mirror → delta-only second run, corruption repair, different-repo refusal, non-repo source rejection) + `tests/replication.rs` end-to-end (real backup → mirror → restore from the mirror byte-identical → second backup → delta replication → mirror sees both snapshots). 156 tests, clippy/fmt green.
 
 - **2026-09-24 (2)** — RBAC / multi-user roles (Phase 6, committed this session): `aegis_core::catalog::auth::Role` — an ordered `Viewer < Operator < Admin` enum stored in the existing `users.role` column; `add_user_with_role`, `set_user_role`, role-aware sessions (the old `role = 'admin'`-only session gate is gone), and unknown-role rejection retained. Server: `require_min_role` gate — reads open to all, mutations (hosts/policies/trigger) need operator, host key rotation and user management need admin; new routes `GET/POST /api/users`, `DELETE /api/users/{username}` (self-removal refused), `POST /api/users/{username}/role`. CLI: `aegis user add --role …` and `aegis user role <name> --role …`. `rbac` integration tests (viewer read-only 403s, operator can operate but not rotate keys/manage users, admin end-to-end user lifecycle) + core role unit tests. 151 tests, clippy/fmt green.
 - **2026-09-24** — MCP server (Phase 6 item 1, committed this session): `aegis-mcp` implemented with `rmcp` 0.11 — stdio MCP server exposing the REST API as tools: list_hosts/add_host/remove_host, trigger_backup (with `agent` flag), list_jobs, list_snapshots, restore_path, get_storage_stats, list_recent_alerts. No business logic duplicated: `api.rs` is a thin reqwest client over the same API the web UI calls (`AEGIS_API_URL` default `http://127.0.0.1:8080`, bearer token from `AEGIS_API_TOKEN`). Library split (`src/lib.rs` + `server.rs`) so tests drive the server over `tokio::io::duplex` with rmcp's client handler: tools/list coverage of all 9 tools and an end-to-end `list_hosts` call against a stub axum backend, plus API-client transport-error tests. 146 tests, clippy/fmt green. Disk: the mingw target dir had ballooned to 45G (stale test exes/rcgu objects) and filled the G: drive mid-session — cleaned to ~7G (old rlibs, exes, incremental, .d/.o files); deleted exes rebuild on demand.

@@ -94,6 +94,21 @@ enum Command {
         max_chunk_size: usize,
     },
 
+    /// Mirror a repository onto a second backend (local or sftp:// URL).
+    /// Copies every object the target is missing; a repeated run transfers
+    /// only the delta. The mirror needs no passphrase to be created.
+    Replicate {
+        /// Source repository location.
+        #[arg(long, value_name = "LOCATION")]
+        repo: String,
+        /// Destination backend location (created on first write).
+        #[arg(long, value_name = "LOCATION")]
+        to: String,
+        /// Re-copy differing objects instead of skipping them (repair mode).
+        #[arg(long)]
+        repair: bool,
+    },
+
     /// Add another passphrase that can open this repository. Data is not
     /// re-encrypted: the existing master key is wrapped under the new
     /// passphrase into a new key slot.
@@ -363,6 +378,43 @@ async fn main() -> Result<()> {
                         "initialized encrypted repository {} at {repo}",
                         r.config().id
                     )
+                },
+            );
+        }
+
+        Command::Replicate { repo, to, repair } => {
+            let source = open_backend(&cli.ssh, &repo)?;
+            let target = open_backend(&cli.ssh, &to)?;
+            let mode = if repair {
+                aegis_core::ReplicateMode::Repair
+            } else {
+                aegis_core::ReplicateMode::Mirror
+            };
+            let stats = aegis_core::replication::replicate(source.as_ref(), target.as_ref(), mode)
+                .await
+                .with_context(|| format!("replicating {repo} -> {to}"))?;
+            emit(
+                cli.json,
+                &serde_json::json!({
+                    "source": repo,
+                    "target": to,
+                    "copied": stats.copied,
+                    "skipped": stats.skipped,
+                    "repaired": stats.repaired,
+                }),
+                || {
+                    println!(
+                        "replicated {} -> {}: {} copied, {} skipped{}",
+                        repo,
+                        to,
+                        stats.copied,
+                        stats.skipped,
+                        if stats.repaired > 0 {
+                            format!(", {} repaired", stats.repaired)
+                        } else {
+                            String::new()
+                        }
+                    );
                 },
             );
         }
