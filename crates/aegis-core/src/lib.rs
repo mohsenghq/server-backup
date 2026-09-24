@@ -35,6 +35,7 @@ pub mod retention;
 pub mod sftp;
 pub mod snapshot;
 pub mod ssh;
+pub mod throttle;
 pub mod tree;
 
 pub use agentless::backup_remote;

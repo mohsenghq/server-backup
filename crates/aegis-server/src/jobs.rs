@@ -69,6 +69,8 @@ pub struct JobTask {
     pub policy_id: String,
     pub host_id: String,
     pub paths_json: String,
+    /// Policy bandwidth limit (kiB/s) pacing backup reads; `None` = unlimited.
+    pub bandwidth_limit_kbps: Option<i32>,
     pub catalog_path: std::path::PathBuf,
     pub master_key: [u8; 32],
 }
@@ -144,7 +146,15 @@ async fn run_task(
         let chunker = repo.config().chunker;
         let paths: Vec<String> = serde_json::from_str(&task.paths_json)
             .map_err(|e| anyhow::anyhow!("parse policy paths: {e}"))?;
-        let snapshot = aegis_core::backup_remote(&repo, &ssh, &cfg, &chunker, &paths).await?;
+        let snapshot = aegis_core::agentless::backup_remote_throttled(
+            &repo,
+            &ssh,
+            &cfg,
+            &chunker,
+            &paths,
+            task.bandwidth_limit_kbps,
+        )
+        .await?;
         catalog
             .record_job_completed(
                 &job_id,

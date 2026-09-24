@@ -63,6 +63,7 @@ pub async fn start(
                             policy_id: policy.id.clone(),
                             host_id: host.id,
                             paths_json: policy.paths_json.clone(),
+                            bandwidth_limit_kbps: policy.bandwidth_limit_kbps,
                             catalog_path: cpath.clone(),
                             master_key,
                         })

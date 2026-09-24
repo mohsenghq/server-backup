@@ -12,7 +12,7 @@ This file is the single source of truth for "where are we." Read it first, every
 
 ## Current status
 
-The workspace builds, lints clean (`clippy -D warnings`, `fmt --check`), and 156 tests pass (76 unit incl. 16 auth + 22 backup/restore integration + 9 property + 5 SFTP + 5 SSH-manager + 3 agentless + 1 host-inventory + 1 real-sshd + 3 server-API + criterion bench + CLI).
+The workspace builds, lints clean (`clippy -D warnings`, `fmt --check`), and 160 tests pass (76 unit incl. 16 auth + 22 backup/restore integration + 9 property + 5 SFTP + 5 SSH-manager + 3 agentless + 1 host-inventory + 1 real-sshd + 3 server-API + criterion bench + CLI).
 
 New in Phase 2:
 
@@ -49,11 +49,13 @@ This session also fixed a real bug found by the property suite on Windows: `rest
 
 ## Next action
 
-Phase 6 items done so far: MCP server, RBAC, multi-backend replication. Next: bandwidth throttling, audit log viewer polish, FUSE (stretch), then Phase 7 hardening.
+Phase 6 items done so far: MCP server, RBAC, multi-backend replication, bandwidth throttling. Remaining: audit log viewer polish, FUSE (stretch), then Phase 7 hardening.
 
 ## Session log
 
 _(newest first — append one short entry per work session; do not delete old entries)_
+
+- **2026-09-24 (4)** — Bandwidth throttling (Phase 6, committed this session): `aegis_core::throttle::BandwidthLimiter` — a lazily-refilled token bucket built from the policy's `bandwidth_limit_kbps` (`None`/<=0 = unlimited); `agentless::backup_remote_throttled` charges each streamed file's bytes to a shared bucket and sleeps off the excess after the chunking pass. Design note: russh-sftp pumps file data through an unbounded internal channel, so gating the reader cannot pace the transfer — the bucket must be charged on the async side. The scheduler passes `policy.bandwidth_limit_kbps` into `JobTask`, so cron-driven jobs are throttled per policy. Snapshots are byte-identical throttled or not. Tests: 3 limiter unit tests (unlimited variants, burst-within-bucket, sustained pacing ≥ rate) + `tests/throttle.rs` end-to-end over the in-process SFTP server (throttled run measurably slower AND byte-identical snapshot trees). 160 tests, clippy/fmt green.
 
 - **2026-09-24 (3)** — Multi-backend replication (Phase 6, committed this session): `aegis_core::replication` — object-level mirror of a repository onto a second `Backend` (local or sftp) without a passphrase on the target (objects are already encrypted at rest). `ReplicateMode::Mirror` copies every source key (`config`, `blobs/`, `snapshots/`, `index/`, `keys/`) missing on the target, so repeated runs transfer only the delta; `Repair` re-copies differing objects; a target whose `config` mismatches the source (different repository) is refused. CLI: `aegis replicate --repo <loc> --to <loc> [--repair]`. Tests: 4 unit tests (full mirror → delta-only second run, corruption repair, different-repo refusal, non-repo source rejection) + `tests/replication.rs` end-to-end (real backup → mirror → restore from the mirror byte-identical → second backup → delta replication → mirror sees both snapshots). 156 tests, clippy/fmt green.
 

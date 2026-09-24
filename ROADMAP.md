@@ -64,7 +64,7 @@ Static plan — what "done" means for each phase. Work top to bottom, in order. 
 - [ ] Key rotation / re-key flow
 - [x] RBAC / multi-user roles
 - [ ] Audit log viewer
-- [ ] Bandwidth throttling
+- [x] Bandwidth throttling
 - [ ] (stretch) FUSE mount browsing of snapshots
 
 ## Phase 7 — Hardening & 1.0

@@ -23,6 +23,7 @@ use crate::error::{Error, Result};
 use crate::repo::Repository;
 use crate::snapshot::SnapshotStats;
 use crate::ssh::{HostConfig, SshManager};
+use crate::throttle::BandwidthLimiter;
 use crate::tree::Node;
 
 /// Per-run state threaded through the recursive walk: what this run has seen
@@ -36,6 +37,8 @@ struct Run<'a> {
     seen: HashSet<String>,
     /// Stored blob sizes this run actually wrote (for the snapshot index).
     written: HashMap<String, u64>,
+    /// Shared bandwidth bucket when a limit is configured.
+    limiter: Option<std::sync::Arc<tokio::sync::Mutex<BandwidthLimiter>>>,
 }
 
 /// Back up every regular file under the remote `paths` into `repo` and return
@@ -57,6 +60,25 @@ pub async fn backup_remote(
     chunker: &ChunkerConfig,
     paths: &[String],
 ) -> Result<crate::snapshot::Snapshot> {
+    backup_remote_throttled(repo, ssh, host, chunker, paths, None).await
+}
+
+/// [`backup_remote`] with an optional bandwidth limit (kiB/s) pacing the
+/// SFTP reads. Snapshots are byte-identical either way.
+///
+/// # Errors
+///
+/// Same as [`backup_remote`].
+pub async fn backup_remote_throttled(
+    repo: &Repository,
+    ssh: &SshManager,
+    host: &HostConfig,
+    chunker: &ChunkerConfig,
+    paths: &[String],
+    bandwidth_limit_kbps: Option<i32>,
+) -> Result<crate::snapshot::Snapshot> {
+    let limiter = BandwidthLimiter::from_kbps(bandwidth_limit_kbps)
+        .map(|l| std::sync::Arc::new(tokio::sync::Mutex::new(l)));
     let sftp = ssh.sftp_channel(host).await?;
     let mut run = Run {
         repo,
@@ -65,6 +87,7 @@ pub async fn backup_remote(
         stats: SnapshotStats::default(),
         seen: HashSet::new(),
         written: HashMap::new(),
+        limiter,
     };
     let mut roots = Vec::with_capacity(paths.len());
     let mut children = Vec::with_capacity(paths.len());
@@ -146,6 +169,13 @@ async fn backup_file(
         .await
         .map_err(|e| Error::Ssh(format!("open {path}: {e}")))?;
 
+    // The chunker drives the reads; the limiter paces the *transfer* after
+    // the pass: each file's bytes are charged to the shared bucket, which
+    // sleeps for the excess over the configured rate. (The SFTP client
+    // delivers file data through an unbounded internal channel, so gating
+    // the reader cannot pace the network transfer.)
+    let limiter = run.limiter.clone();
+    let mut transferred: u64 = 0;
     let mut chunk_hashes = Vec::new();
     // The sink is sync, so first-sight chunk bytes are buffered here and
     // stored after the pass. Already-seen chunks (this run or an earlier
@@ -157,12 +187,17 @@ async fn backup_file(
         run.stats.chunks += 1;
         run.stats.bytes += chunk.length as u64;
         chunk_hashes.push(hex.clone());
+        transferred += chunk.length as u64;
         if !run.seen.contains(&hex) && !pending.iter().any(|(h, _)| h == &hex) {
             pending.push((hex, bytes.to_vec()));
         }
         Ok(())
     })
     .await?;
+
+    if let Some(l) = &limiter {
+        l.lock().await.acquire(transferred).await;
+    }
 
     for (hex, bytes) in pending {
         run.repo
