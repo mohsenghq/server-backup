@@ -12,7 +12,7 @@ This file is the single source of truth for "where are we." Read it first, every
 
 ## Current status
 
-The workspace builds, lints clean (`clippy -D warnings`, `fmt --check`), and 129 tests pass (76 unit incl. 16 auth + 22 backup/restore integration + 9 property + 5 SFTP + 5 SSH-manager + 3 agentless + 1 host-inventory + 1 real-sshd + 3 server-API + criterion bench + CLI).
+The workspace builds, lints clean (`clippy -D warnings`, `fmt --check`), and 143 tests pass (76 unit incl. 16 auth + 22 backup/restore integration + 9 property + 5 SFTP + 5 SSH-manager + 3 agentless + 1 host-inventory + 1 real-sshd + 3 server-API + criterion bench + CLI).
 
 New in Phase 2:
 
@@ -49,11 +49,13 @@ This session also fixed a real bug found by the property suite on Windows: `rest
 
 ## Next action
 
-Phase 5 agent auto-push and lifecycle management are done. Next: Tauri v2 desktop shell (Phase 5) or the MCP server (Phase 6) per ROADMAP.
+Phase 5 (agent mode, lifecycle, Tauri desktop shell) is complete. Next: the MCP server (`aegis-mcp`, Phase 6) per ROADMAP.
 
 ## Session log
 
 _(newest first — append one short entry per work session; do not delete old entries)_
+
+- **2026-09-23 (7)** — Tauri v2 desktop shell (Phase 5 complete, committed this session): `crates/aegis-web/src-tauri` (package `aegis-desktop`) wraps `aegis-web` — `lib.rs` spawns the `aegis-server` sidecar binary (`binaries/aegis-server-<target-triple>.exe`, `externalBin` in tauri.conf.json) on an ephemeral port, waits for `/health`, then loads the web UI pointing at it; without a passphrase it runs UI-only against a stubbed backend. Capabilities grant `shell:allow-spawn` + sidecar execute. `scripts/build-desktop.sh` copies the release `aegis-server` binary to the sidecar name (host triple from `rustc -vV`), runs the Vite build, then `tauri build` (msi/appimage/deb). CI: test/clippy jobs now use `--exclude aegis-desktop` and a new matrix `desktop` job (ubuntu+windows, apt deps for webkit2gtk on Linux) builds the bundle and uploads installers as artifacts. Machine-local caveat: the local mingw toolchain cannot link the cdylib (`corrupt .drectve` linker warning); `cargo check` and lib tests pass, msvc CI unaffected. 143 tests, clippy/fmt green (both excluding aegis-desktop).
 
 - **2026-09-23 (6)** — Agent lifecycle management (committed this session): `aegis_core::agent::{install,status,upgrade}` — install uploads the platform binary to `/usr/local/bin/aegis-agent` (sudo when non-root), writes a systemd oneshot service + `OnCalendar` timer + EnvironmentFile (passphrase never in `ps`), enables the timer, and reports `systemctl is-enabled`; `status` asks the target via `test -x … && … --version`; `upgrade` re-runs the installer (idempotent). CLI: `aegis host agent-install/agent-status/agent-upgrade`. `agent_lifecycle` tests cover the Unsupported fallback path, status round-trip, and shell-quoting safety. 143 tests, clippy/fmt green.
 

@@ -54,8 +54,8 @@ Static plan — what "done" means for each phase. Work top to bottom, in order. 
 
 - [x] Auto-push/install of `aegis-agent` over an existing SSH session
 - [x] Agent lifecycle management from the server (start/stop/upgrade)
-- [ ] Tauri v2 shell around `aegis-web` (Windows + Linux)
-- [ ] Local sidecar bundling of `aegis-server` in the desktop app
+- [x] Tauri v2 shell around `aegis-web` (Windows + Linux)
+- [x] Local sidecar bundling of `aegis-server` in the desktop app
 
 ## Phase 6 — MCP Server + Advanced Features
 

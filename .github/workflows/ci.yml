@@ -31,8 +31,10 @@ jobs:
           cd crates/aegis-web
           npm ci || npm install
           npm run build
-      - run: cargo build --workspace --all-targets
-      - run: cargo test --workspace
+      # aegis-desktop's cdylib needs Tauri system libs; it's built in the
+      # dedicated desktop job, not here.
+      - run: cargo build --workspace --exclude aegis-desktop --all-targets
+      - run: cargo test --workspace --exclude aegis-desktop
 
   lint:
     name: fmt + clippy
@@ -117,3 +119,44 @@ jobs:
           AEGIS_E2E_SSH_USER: aegis
           AEGIS_E2E_PATHS: /srv/backup-me
           AEGIS_E2E_REPO: /tmp/aegis-e2e-repo
+
+  # Phase 5: the Tauri desktop shell compiles and bundles (msi/appimage/deb).
+  # The sidecar aegis-server binary is built in-job and copied into place by
+  # scripts/build-desktop.sh.
+  desktop:
+    name: desktop bundle (tauri)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-${{ matrix.os }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install Tauri system deps (linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev
+      - name: Build desktop bundle
+        run: bash scripts/build-desktop.sh
+        env:
+          RELEASE: "1"
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: aegis-desktop-linux
+          path: target/release/bundle/*/Aegis*.{AppImage,deb}
+          if-no-files-found: warn
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: aegis-desktop-windows
+          path: target/release/bundle/msi/*.msi
+          if-no-files-found: warn

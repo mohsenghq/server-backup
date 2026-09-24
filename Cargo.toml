@@ -6,6 +6,7 @@ members = [
     "crates/aegis-server",
     "crates/aegis-agent",
     "crates/aegis-mcp",
+    "crates/aegis-web/src-tauri",
 ]
 
 [workspace.package]
