@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
 
+use aegis_core::catalog::auth::{Role, User};
 use aegis_core::catalog::Policy;
 use uuid::Uuid;
 
@@ -37,6 +38,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/policies/{id}", delete(remove_policy))
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/me", get(me))
+        .route("/api/users", get(list_users).post(add_user))
+        .route("/api/users/{username}", delete(remove_user))
+        .route("/api/users/{username}/role", post(set_role))
         .route("/api/audit", get(audit_log))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -148,13 +152,129 @@ async fn logout(
 
 /// `GET /api/auth/me` ⇔ `aegis session show`.
 async fn me(
-    axum::Extension(user): axum::Extension<aegis_core::catalog::auth::User>,
+    axum::Extension(user): axum::Extension<User>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     Ok(Json(serde_json::json!({
         "id": user.id,
         "username": user.username,
-        "role": user.role,
+        "role": user.role.as_str(),
     })))
+}
+
+/// `GET /api/users` — admin-only user listing.
+async fn list_users(
+    State(state): State<AppState>,
+    axum::Extension(user): axum::Extension<User>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_min_role(&user, Role::Admin)?;
+    let users = state.catalog.list_users().await?;
+    Ok(Json(serde_json::json!(users
+        .iter()
+        .map(|u| serde_json::json!({
+            "id": u.id,
+            "username": u.username,
+            "role": u.role.as_str(),
+        }))
+        .collect::<Vec<_>>())))
+}
+
+/// `POST /api/users` — admin-only user creation.
+#[derive(Deserialize)]
+pub struct AddUserRequest {
+    pub username: String,
+    pub password: String,
+    #[serde(default = "default_role")]
+    pub role: String,
+}
+
+fn default_role() -> String {
+    "operator".to_string()
+}
+
+async fn add_user(
+    State(state): State<AppState>,
+    axum::Extension(user): axum::Extension<User>,
+    Json(req): Json<AddUserRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_min_role(&user, Role::Admin)?;
+    let role = Role::from_str(&req.role)
+        .map_err(|_| ApiError::bad_request(format!("unknown role `{}`", req.role)))?;
+    let created = state
+        .catalog
+        .add_user_with_role(&req.username, &req.password, role)
+        .await
+        .map_err(|e| match e {
+            aegis_core::Error::InvalidInput(message) => ApiError::bad_request(message),
+            other => ApiError::internal(other.to_string()),
+        })?;
+    let _ = state
+        .catalog
+        .audit(Some(&user.id), "user.add", Some(&req.username))
+        .await;
+    Ok(Json(serde_json::json!({
+        "id": created.id,
+        "username": created.username,
+        "role": created.role.as_str(),
+    })))
+}
+
+/// `DELETE /api/users/{username}` — admin-only user removal (not self).
+async fn remove_user(
+    State(state): State<AppState>,
+    axum::Extension(user): axum::Extension<User>,
+    UrlPath(username): UrlPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_min_role(&user, Role::Admin)?;
+    if username == user.username {
+        return Err(ApiError::bad_request("cannot remove your own account"));
+    }
+    let removed = state.catalog.remove_user(&username).await?;
+    if !removed {
+        return Err(ApiError::not_found(format!("user `{username}` not found")));
+    }
+    let _ = state
+        .catalog
+        .audit(Some(&user.id), "user.remove", Some(&username))
+        .await;
+    Ok(Json(
+        serde_json::json!({ "username": username, "removed": true }),
+    ))
+}
+
+/// `POST /api/users/{username}/role` — admin-only role change.
+#[derive(Deserialize)]
+pub struct SetRoleRequest {
+    pub role: String,
+}
+
+async fn set_role(
+    State(state): State<AppState>,
+    axum::Extension(user): axum::Extension<User>,
+    UrlPath(username): UrlPath<String>,
+    Json(req): Json<SetRoleRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_min_role(&user, Role::Admin)?;
+    let role = Role::from_str(&req.role)
+        .map_err(|_| ApiError::bad_request(format!("unknown role `{}`", req.role)))?;
+    let updated = state
+        .catalog
+        .set_user_role(&username, role)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    if !updated {
+        return Err(ApiError::not_found(format!("user `{username}` not found")));
+    }
+    let _ = state
+        .catalog
+        .audit(
+            Some(&user.id),
+            "user.role_set",
+            Some(&format!("{username}={}", role.as_str())),
+        )
+        .await;
+    Ok(Json(
+        serde_json::json!({ "username": username, "role": role.as_str() }),
+    ))
 }
 
 /// `POST /api/hosts` ⇔ `aegis host add`.
@@ -181,11 +301,27 @@ fn default_mode() -> String {
     "agentless".to_string()
 }
 
+/// Role gate: read-only endpoints are open to every authenticated user;
+/// mutations require at least `Role::Operator`; user/key management
+/// requires `Role::Admin`. `me` is the request's authenticated user.
+fn require_min_role(user: &User, min: Role) -> Result<(), ApiError> {
+    if user.role >= min {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(format!(
+            "role `{}` may not perform this action (requires `{}`)",
+            user.role.as_str(),
+            min.as_str()
+        )))
+    }
+}
+
 async fn add_host(
     State(state): State<AppState>,
-    axum::Extension(user): axum::Extension<aegis_core::catalog::auth::User>,
+    axum::Extension(user): axum::Extension<User>,
     Json(req): Json<AddHostRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_min_role(&user, Role::Operator)?;
     let mode: aegis_core::catalog::BackupMode = req
         .mode
         .parse()
@@ -237,9 +373,10 @@ async fn list_hosts(State(state): State<AppState>) -> Result<Json<serde_json::Va
 /// `DELETE /api/hosts/:id` ⇔ `aegis host remove`.
 async fn remove_host(
     State(state): State<AppState>,
-    axum::Extension(user): axum::Extension<aegis_core::catalog::auth::User>,
+    axum::Extension(user): axum::Extension<User>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_min_role(&user, Role::Operator)?;
     let removed = state.catalog.remove_host(&id).await?;
     if !removed {
         return Err(ApiError::not_found(format!("host `{id}` not found")));
@@ -260,10 +397,11 @@ pub struct RotateKeyRequest {
 
 async fn rotate_host_key(
     State(state): State<AppState>,
-    axum::Extension(user): axum::Extension<aegis_core::catalog::auth::User>,
+    axum::Extension(user): axum::Extension<User>,
     UrlPath(id): UrlPath<String>,
     Json(req): Json<RotateKeyRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_min_role(&user, Role::Admin)?;
     state
         .catalog
         .set_host_key(&id, req.ssh_key_pem.as_bytes(), state.master_key())
@@ -345,11 +483,12 @@ struct TriggerResponse {
 
 async fn trigger(
     State(state): State<AppState>,
-    axum::Extension(user): axum::Extension<aegis_core::catalog::auth::User>,
+    axum::Extension(user): axum::Extension<User>,
     Json(req): Json<TriggerRequest>,
 ) -> Result<Json<TriggerResponse>, ApiError> {
     use aegis_core::sftp::SftpAuth;
 
+    require_min_role(&user, Role::Operator)?;
     for p in &req.paths {
         if !p.starts_with('/') {
             return Err(ApiError::bad_request(format!(
@@ -586,9 +725,10 @@ pub struct AddPolicyRequest {
 
 async fn add_policy(
     State(state): State<AppState>,
-    axum::Extension(user): axum::Extension<aegis_core::catalog::auth::User>,
+    axum::Extension(user): axum::Extension<User>,
     Json(req): Json<AddPolicyRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_min_role(&user, Role::Operator)?;
     let policy = Policy {
         id: Uuid::new_v4().to_string(),
         name: req.name.clone(),
@@ -623,9 +763,10 @@ async fn add_policy(
 /// `DELETE /api/policies/{id}` ⇔ `aegis policy remove`.
 async fn remove_policy(
     State(state): State<AppState>,
-    axum::Extension(user): axum::Extension<aegis_core::catalog::auth::User>,
+    axum::Extension(user): axum::Extension<User>,
     UrlPath(id): UrlPath<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    require_min_role(&user, Role::Operator)?;
     let removed = state.catalog.remove_policy(&id).await?;
     if !removed {
         return Err(ApiError::not_found(format!("policy `{id}` not found")));
@@ -644,6 +785,12 @@ struct ApiError {
 }
 
 impl ApiError {
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
     fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,

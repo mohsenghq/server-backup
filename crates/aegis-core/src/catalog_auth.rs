@@ -21,7 +21,40 @@ const SESSION_TTL_SECS: i64 = 24 * 60 * 60;
 const USERNAME_MAX: usize = 64;
 const PASSWORD_MIN: usize = 12;
 const PASSWORD_MAX: usize = 1024;
-const ROLE_ADMIN: &str = "admin";
+/// A user's permission level. Ordered from least to most privileged.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+pub enum Role {
+    /// Read-only: list hosts/jobs/snapshots/audit, no mutations.
+    Viewer,
+    /// Day-to-day operation: everything except user and key management.
+    Operator,
+    /// Full control, including user management and key rotation.
+    Admin,
+}
+
+impl Role {
+    pub const ALL: [Role; 3] = [Role::Viewer, Role::Operator, Role::Admin];
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Role::Viewer => "viewer",
+            Role::Operator => "operator",
+            Role::Admin => "admin",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(role: &str) -> Result<Role> {
+        match role {
+            "admin" => Ok(Role::Admin),
+            "operator" => Ok(Role::Operator),
+            "viewer" => Ok(Role::Viewer),
+            other => Err(Error::Catalog(format!("unknown role `{other}`"))),
+        }
+    }
+}
 const LOGIN_LIMIT: i64 = 30;
 const LOGIN_WINDOW_SECS: i64 = 60;
 const LOGIN_BUCKET: &str = "global";
@@ -32,7 +65,7 @@ const DUMMY_HASH: &str = "$argon2id$v=19$m=65536,t=3,p=1$MDEyMzQ1NjcwMTIzNDU2Nw$
 pub struct User {
     pub id: String,
     pub username: String,
-    pub role: String,
+    pub role: Role,
 }
 
 #[derive(Clone)]
@@ -167,19 +200,12 @@ fn user_from_row(row: &SqliteRow) -> Result<User> {
         username: row
             .try_get("username")
             .map_err(catalog_err("reading username"))?,
-        role: role_from_str(&role)?,
+        role: Role::from_str(&role)?,
     })
 }
 
 fn catalog_err(context: &'static str) -> impl Fn(sqlx::Error) -> Error + 'static {
     move |e| Error::Catalog(format!("{context}: {e}"))
-}
-
-fn role_from_str(role: &str) -> Result<String> {
-    match role {
-        ROLE_ADMIN => Ok(role.to_string()),
-        other => Err(Error::Catalog(format!("unknown role `{other}`"))),
-    }
 }
 
 impl Catalog {
@@ -220,14 +246,31 @@ impl Catalog {
     }
 
     pub async fn add_user(&self, username: &str, password: &str) -> Result<User> {
+        self.add_user_with_role(username, password, Role::Admin)
+            .await
+    }
+
+    /// Create a user with an explicit role (defaults to admin via [`Catalog::add_user`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidInput`] for bad usernames/passwords and
+    /// duplicate usernames; [`Error::Catalog`] on storage failures.
+    pub async fn add_user_with_role(
+        &self,
+        username: &str,
+        password: &str,
+        role: Role,
+    ) -> Result<User> {
         validate_username(username)?;
         validate_password(password)?;
         let hash = self.hash_in_background(password).await?;
         let id = uuid::Uuid::new_v4().to_string();
-        sqlx::query("INSERT INTO users (id, username, password_hash) VALUES (?, ?, ?)")
+        sqlx::query("INSERT INTO users (id, username, password_hash, role) VALUES (?, ?, ?, ?)")
             .bind(&id)
             .bind(username)
             .bind(&hash)
+            .bind(role.as_str())
             .execute(&self.pool)
             .await
             .map_err(|e| match e.as_database_error() {
@@ -239,8 +282,24 @@ impl Catalog {
         Ok(User {
             id,
             username: username.to_string(),
-            role: ROLE_ADMIN.to_string(),
+            role,
         })
+    }
+
+    /// Change a user's role. Returns `false` if the user does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Catalog`] on storage failures.
+    pub async fn set_user_role(&self, username: &str, role: Role) -> Result<bool> {
+        validate_username(username)?;
+        let res = sqlx::query("UPDATE users SET role = ? WHERE username = ?")
+            .bind(role.as_str())
+            .bind(username)
+            .execute(&self.pool)
+            .await
+            .map_err(catalog_err("updating role"))?;
+        Ok(res.rows_affected() > 0)
     }
 
     pub async fn list_users(&self) -> Result<Vec<User>> {
@@ -325,7 +384,7 @@ impl Catalog {
             .map_err(catalog_err("cleaning sessions"))?;
         let inserted = sqlx::query(
             "INSERT INTO sessions (token_hash, user_id, expires_at)
-             SELECT ?, id, ? FROM users WHERE id = ? AND password_hash = ? AND role = 'admin'",
+             SELECT ?, id, ? FROM users WHERE id = ? AND password_hash = ?",
         )
         .bind(&token_hash)
         .bind(expires_at)
@@ -428,7 +487,7 @@ mod tests {
     async fn add_list_remove_roundtrip() {
         let c = cat().await;
         let u = cat_user(&c, "alice").await;
-        assert_eq!(u.role, ROLE_ADMIN);
+        assert_eq!(u.role, Role::Admin);
         let users = c.list_users().await.unwrap();
         assert_eq!(users.len(), 1);
         assert_eq!(users[0].username, "alice");
@@ -690,6 +749,45 @@ mod tests {
             attempts, 1,
             "role failure surfaces after the throttle check"
         );
+    }
+
+    #[tokio::test]
+    async fn roles_create_login_and_persist() {
+        let c = cat().await;
+        for (name, role) in [
+            ("boss", Role::Admin),
+            ("operator-1", Role::Operator),
+            ("watcher", Role::Viewer),
+        ] {
+            let u = c
+                .add_user_with_role(name, GOOD_PASSWORD, role)
+                .await
+                .unwrap();
+            assert_eq!(u.role, role);
+            let s = c.login(name, GOOD_PASSWORD).await.unwrap();
+            assert_eq!(s.user.role, role);
+            let back = c.session_user(&s.token).await.unwrap();
+            assert_eq!(back.role, role);
+        }
+        let users = c.list_users().await.unwrap();
+        assert_eq!(users.len(), 3);
+        assert!(users.iter().any(|u| u.role == Role::Viewer));
+    }
+
+    #[tokio::test]
+    async fn set_user_role_roundtrip_and_unknown_user() {
+        let c = cat().await;
+        cat_user(&c, "alice").await;
+        assert!(c.set_user_role("alice", Role::Viewer).await.unwrap());
+        let s = c.login("alice", GOOD_PASSWORD).await.unwrap();
+        assert_eq!(s.user.role, Role::Viewer);
+        assert!(!c.set_user_role("ghost", Role::Admin).await.unwrap());
+        for bad in ["superuser", "", "ADMIN"] {
+            assert!(
+                Role::from_str(bad).is_err(),
+                "role {bad:?} must be rejected"
+            );
+        }
     }
 
     #[tokio::test]

@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
+use aegis_core::catalog::auth::Role;
 use aegis_core::catalog::Catalog;
 use anyhow::Result;
 use clap::Args;
@@ -35,6 +36,9 @@ pub enum UserCommand {
         catalog: PathBuf,
         #[arg(long, value_name = "NAME")]
         username: String,
+        /// Role for the new user: viewer, operator, or admin (default admin).
+        #[arg(long, value_name = "ROLE", default_value = "admin")]
+        role: String,
     },
     /// List local administrators.
     List {
@@ -54,6 +58,15 @@ pub enum UserCommand {
         catalog: PathBuf,
         #[arg(value_name = "NAME")]
         username: String,
+    },
+    /// Change a user's role (viewer, operator, admin).
+    Role {
+        #[arg(long, value_name = "FILE", default_value = "aegis-catalog.db")]
+        catalog: PathBuf,
+        #[arg(value_name = "NAME")]
+        username: String,
+        #[arg(long, value_name = "ROLE")]
+        role: String,
     },
 }
 
@@ -154,8 +167,8 @@ pub async fn run_session(command: &SessionCommand, json: bool) -> anyhow::Result
             let user = c.session_user(&token).await?;
             crate::emit(
                 json,
-                &serde_json::json!({ "id": user.id, "username": user.username, "role": user.role }),
-                || println!("{} ({})", user.username, user.role),
+                &serde_json::json!({ "id": user.id, "username": user.username, "role": user.role.as_str() }),
+                || println!("{} ({})", user.username, user.role.as_str()),
             );
         }
     }
@@ -164,15 +177,21 @@ pub async fn run_session(command: &SessionCommand, json: bool) -> anyhow::Result
 
 pub async fn run_user(command: &UserCommand, json: bool) -> anyhow::Result<()> {
     match command {
-        UserCommand::Add { catalog, username } => {
+        UserCommand::Add {
+            catalog,
+            username,
+            role,
+        } => {
+            let role = Role::from_str(role)
+                .map_err(|_| anyhow::anyhow!("unknown role `{role}` (viewer, operator, admin)"))?;
             let password = load_password("new user password: ")?;
             let c = open_catalog(catalog).await?;
-            let user = c.add_user(username, &password).await?;
+            let user = c.add_user_with_role(username, &password, role).await?;
             c.audit(None, "user.add", Some(username)).await.ok();
             crate::emit(
                 json,
-                &serde_json::json!({ "id": user.id, "username": user.username, "role": user.role }),
-                || println!("added user {} ({})", user.username, user.role),
+                &serde_json::json!({ "id": user.id, "username": user.username, "role": user.role.as_str() }),
+                || println!("added user {} ({})", user.username, user.role.as_str()),
             );
         }
         UserCommand::List { catalog } => {
@@ -184,7 +203,7 @@ pub async fn run_user(command: &UserCommand, json: bool) -> anyhow::Result<()> {
                     serde_json::json!({
                         "id": u.id,
                         "username": u.username,
-                        "role": u.role,
+                        "role": u.role.as_str(),
                     })
                 })
                 .collect();
@@ -195,7 +214,7 @@ pub async fn run_user(command: &UserCommand, json: bool) -> anyhow::Result<()> {
                 }
                 println!("{:<38}  {:<24}  ROLE", "ID", "USERNAME");
                 for u in &users {
-                    println!("{:<38}  {:<24}  {}", u.id, u.username, u.role);
+                    println!("{:<38}  {:<24}  {}", u.id, u.username, u.role.as_str());
                 }
             });
         }
@@ -230,6 +249,30 @@ pub async fn run_user(command: &UserCommand, json: bool) -> anyhow::Result<()> {
                 || {
                     if updated {
                         println!("password updated for {username}; sessions revoked");
+                    } else {
+                        println!("no user named {username}");
+                    }
+                },
+            );
+        }
+        UserCommand::Role {
+            catalog,
+            username,
+            role,
+        } => {
+            let role = Role::from_str(role)
+                .map_err(|_| anyhow::anyhow!("unknown role `{role}` (viewer, operator, admin)"))?;
+            let c = open_catalog(catalog).await?;
+            let updated = c.set_user_role(username, role).await?;
+            if updated {
+                c.audit(None, "user.role_set", Some(username)).await.ok();
+            }
+            crate::emit(
+                json,
+                &serde_json::json!({ "username": username, "role": role.as_str(), "updated": updated }),
+                || {
+                    if updated {
+                        println!("{username} is now {}", role.as_str());
                     } else {
                         println!("no user named {username}");
                     }
