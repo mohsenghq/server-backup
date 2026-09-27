@@ -50,6 +50,24 @@ pub struct RepoConfig {
     pub key_slot: String,
 }
 
+/// What a repository currently costs on disk and how much duplication it
+/// saves (see [`Repository::stats`]).
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageStats {
+    /// Where the backend stores the data.
+    pub repo: String,
+    /// Bytes physically stored (every distinct referenced blob).
+    pub bytes_stored: u64,
+    /// Sum of every snapshot's logical source size.
+    pub bytes_logical: u64,
+    /// Sum of every snapshot's newly written bytes.
+    pub bytes_written: u64,
+    /// `1 - bytes_written / bytes_logical`; 0 for an empty repository.
+    pub dedup_ratio: f64,
+    /// Number of snapshots.
+    pub snapshots: usize,
+}
+
 /// An open Aegis repository.
 ///
 /// A repository is a set of keys in a [`Backend`]; `LocalBackend` is only one
@@ -864,6 +882,48 @@ impl Repository {
         })
     }
 
+    /// Aggregate storage numbers: what the backend holds, what the snapshots
+    /// logically contain, and the resulting dedup ratio.
+    ///
+    /// `bytes_stored` is the size of every distinct blob the snapshots
+    /// reference (read from the per-snapshot indexes, so no chunk is
+    /// downloaded); manifests and indexes themselves are not counted — they
+    /// are kilobytes against gigabytes of data.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors from [`Repository::list_snapshots`] and
+    /// [`Repository::snapshot_index`].
+    pub async fn stats(&self) -> Result<StorageStats> {
+        let snapshots = self.list_snapshots().await?;
+        let mut seen = HashSet::new();
+        let mut bytes_stored = 0u64;
+        let mut bytes_logical = 0u64;
+        let mut bytes_written = 0u64;
+        for s in &snapshots {
+            bytes_logical = bytes_logical.saturating_add(s.stats.bytes);
+            bytes_written = bytes_written.saturating_add(s.stats.new_bytes);
+            for blob in self.snapshot_index(s).await?.blobs {
+                if seen.insert(blob.hash) {
+                    bytes_stored = bytes_stored.saturating_add(blob.size.unwrap_or(0));
+                }
+            }
+        }
+        let dedup_ratio = if bytes_logical == 0 {
+            0.0
+        } else {
+            1.0 - (bytes_written as f64 / bytes_logical as f64)
+        };
+        Ok(StorageStats {
+            repo: self.backend.describe(),
+            bytes_stored,
+            bytes_logical,
+            bytes_written,
+            dedup_ratio,
+            snapshots: snapshots.len(),
+        })
+    }
+
     /// Restore a snapshot's files beneath `target`.
     ///
     /// File contents are streamed chunk-by-chunk to disk; peak memory is
@@ -881,28 +941,8 @@ impl Repository {
         tokio::fs::create_dir_all(target)
             .await
             .map_err(|e| Error::io(target, e))?;
-        // The synthetic root is a container, not a directory from the source
-        // filesystem: its children — one per backed-up path — are laid
-        // directly into `target`, so restoring recreates each backed-up
-        // directory by name, exactly as Phase 0 did. A root whose
-        // serialization exceeded `INLINE_LIMIT` is stored as a ref blob; it
-        // must be fetched and unwrapped first, or the whole tree would be
-        // nested one level too deep under the ref's ("root") name.
-        let root_owned: Node;
-        let root: &Node = match &snapshot.root {
-            Node::Ref { hash, .. } => {
-                let stored = self.backend.get(&blob_key(hash)).await?;
-                let bytes = decode_blob_hash_ctx(self.crypto.as_ref(), hash, &stored)?;
-                root_owned = serde_json::from_slice(&bytes).map_err(|source| Error::Malformed {
-                    what: format!("tree node {hash}"),
-                    source,
-                })?;
-                root_owned.validate()?;
-                &root_owned
-            }
-            other => other,
-        };
-        match root {
+        let root = self.load_root(&snapshot).await?;
+        match root.as_ref() {
             Node::Dir { children, .. } => {
                 for child in children {
                     restore_node(self.backend.as_ref(), self.crypto.as_ref(), child, target)
@@ -914,6 +954,96 @@ impl Repository {
             }
         }
         Ok(snapshot)
+    }
+
+    /// Restore only the part of a snapshot under `path_in_snapshot`.
+    ///
+    /// `path_in_snapshot` is matched component by component against the tree's
+    /// names, with or without a leading slash (`"etc/ssh"`, `"/etc/ssh"`).
+    /// Descent stops at the first node that is a file or is stored as a ref
+    /// blob: from there down the whole subtree is restored, since resolving a
+    /// ref needs a backend read per level. An empty path restores the entire
+    /// snapshot, identically to [`Repository::restore`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SnapshotNotFound`] if no snapshot matches, and
+    /// [`Error::InvalidInput`] when `path_in_snapshot` matches nothing in the
+    /// snapshot (nothing is written in that case).
+    pub async fn restore_path(
+        &self,
+        id_or_prefix: &str,
+        path_in_snapshot: &str,
+        target: impl AsRef<Path>,
+    ) -> Result<Snapshot> {
+        let snapshot = self.find_snapshot(id_or_prefix).await?;
+        let target = target.as_ref();
+        let components: Vec<&str> = path_in_snapshot
+            .split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .collect();
+        if components.is_empty() {
+            return self.restore(&snapshot.id, target).await;
+        }
+        let root = self.load_root(&snapshot).await?;
+        let mut nodes: Vec<&Node> = match root.as_ref() {
+            Node::Dir { children, .. } => children.iter().collect(),
+            other => vec![other],
+        };
+        let mut matched = 0usize;
+        'descend: for component in components {
+            for node in &nodes {
+                if node.name() == component {
+                    nodes = match node {
+                        Node::Dir { children, .. } => children.iter().collect(),
+                        // A file (or a ref'd node) is the deepest point the
+                        // inline tree can resolve: restore it whole.
+                        _ => Vec::new(),
+                    };
+                    matched += 1;
+                    continue 'descend;
+                }
+            }
+            break;
+        }
+        if matched == 0 {
+            return Err(Error::InvalidInput(format!(
+                "`{path_in_snapshot}` is not in snapshot {}",
+                snapshot.short_id()
+            )));
+        }
+        tokio::fs::create_dir_all(target)
+            .await
+            .map_err(|e| Error::io(target, e))?;
+        for node in &nodes {
+            restore_node(self.backend.as_ref(), self.crypto.as_ref(), node, target).await?;
+        }
+        Ok(snapshot)
+    }
+
+    /// The snapshot's root node with a ref'd root blob fetched and unwrapped.
+    ///
+    /// The synthetic root is a container, not a directory from the source
+    /// filesystem: its children — one per backed-up path — are laid directly
+    /// into the restore target, so restoring recreates each backed-up directory
+    /// by name. A root whose serialization exceeded `INLINE_LIMIT` is stored as
+    /// a ref blob and must be fetched first, or the whole tree would be nested
+    /// one level too deep under the ref's ("root") name.
+    async fn load_root<'a>(&'a self, snapshot: &'a Snapshot) -> Result<std::borrow::Cow<'a, Node>> {
+        match &snapshot.root {
+            Node::Ref { hash, .. } => {
+                let stored = self.backend.get(&blob_key(hash)).await?;
+                let bytes = decode_blob_hash_ctx(self.crypto.as_ref(), hash, &stored)?;
+                let node: Node =
+                    serde_json::from_slice(&bytes).map_err(|source| Error::Malformed {
+                        what: format!("tree node {hash}"),
+                        source,
+                    })?;
+                node.validate()?;
+                Ok(std::borrow::Cow::Owned(node))
+            }
+            other => Ok(std::borrow::Cow::Borrowed(other)),
+        }
     }
 
     /// Union of all blob hashes reachable from a set of snapshots. `index/`

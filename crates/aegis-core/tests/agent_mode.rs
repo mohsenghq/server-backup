@@ -76,6 +76,10 @@ async fn agent_backs_up_into_sftp_repo() {
     let dir = tempfile::tempdir().unwrap();
     let paths = seed(dir.path());
     let repo_root = dir.path().join("sftp-repo");
+    // The SFTP server can create children of its root but not the root
+    // itself, exactly like a real sshd: it needs the target directory to
+    // exist before the first write.
+    std::fs::create_dir_all(&repo_root).unwrap();
 
     let port = sftp_server::spawn_sftp_server(repo_root.clone())
         .await

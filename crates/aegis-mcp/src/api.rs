@@ -92,7 +92,22 @@ impl ApiClient {
         self.get("/api/hosts").await
     }
 
-    pub async fn add_host(&self, payload: Value) -> Result<Value, ApiError> {
+    /// The server's `AddHostRequest` field names (`ssh_user`, `ssh_port`).
+    pub async fn add_host(
+        &self,
+        name: &str,
+        address: &str,
+        ssh_user: &str,
+        ssh_port: Option<u16>,
+    ) -> Result<Value, ApiError> {
+        let mut payload = serde_json::json!({
+            "name": name,
+            "address": address,
+            "ssh_user": ssh_user,
+        });
+        if let Some(port) = ssh_port {
+            payload["ssh_port"] = serde_json::json!(port);
+        }
         self.post("/api/hosts", payload).await
     }
 
@@ -100,12 +115,19 @@ impl ApiClient {
         self.delete(&format!("/api/hosts/{id}")).await
     }
 
-    pub async fn trigger_backup(&self, host_id: &str, agent: bool) -> Result<Value, ApiError> {
-        self.post(
-            "/api/jobs/trigger",
-            serde_json::json!({ "host_id": host_id, "agent": agent }),
-        )
-        .await
+    /// `repo` may be omitted: the server then uses its own repository.
+    pub async fn trigger_backup(
+        &self,
+        host_id: &str,
+        paths: &[String],
+        repo: Option<&str>,
+        agent: bool,
+    ) -> Result<Value, ApiError> {
+        let mut payload = serde_json::json!({ "host_id": host_id, "paths": paths, "agent": agent });
+        if let Some(repo) = repo {
+            payload["repo"] = serde_json::json!(repo);
+        }
+        self.post("/api/jobs/trigger", payload).await
     }
 
     pub async fn list_jobs(&self) -> Result<Value, ApiError> {

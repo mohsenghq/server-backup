@@ -9,6 +9,9 @@
 
 pub mod api;
 pub mod jobs;
+pub mod metrics;
+pub mod notify;
+pub mod repo;
 pub mod scheduler;
 pub mod state;
 
@@ -37,6 +40,7 @@ pub async fn serve(
         app_state.events.clone(),
     )
     .await?;
+    tracing::info!(addr = %addr, catalog = %catalog_path.display(), "aegis-server ready");
     let app = api::router(app_state);
     // Serve the web UI when a built bundle is available. SPA fallback to
     // index.html for client-side routes; `/api` and `/health` routes take

@@ -24,6 +24,9 @@ use uuid::Uuid;
 pub fn router(state: AppState) -> Router {
     let public = Router::new()
         .route("/health", get(health))
+        // Prometheus scrapers cannot present a bearer session; the endpoint
+        // exposes counts and byte totals only, never paths or secrets.
+        .route("/metrics", get(metrics))
         .route("/api/auth/login", post(login))
         .with_state(state.clone());
     let protected = Router::new()
@@ -31,6 +34,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/hosts/{id}", delete(remove_host))
         .route("/api/hosts/{id}/test", post(test_host))
         .route("/api/hosts/{id}/key", post(rotate_host_key))
+        .route("/api/hosts/{id}/snapshots", get(host_snapshots))
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/ws", get(jobs_ws))
         .route("/api/jobs/trigger", post(trigger))
@@ -42,12 +46,35 @@ pub fn router(state: AppState) -> Router {
         .route("/api/users/{username}", delete(remove_user))
         .route("/api/users/{username}/role", post(set_role))
         .route("/api/audit", get(audit_log))
+        .route("/api/restore", post(restore))
+        .route("/api/stats", get(stats))
+        .route("/api/alerts", get(alerts))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             require_session,
         ))
         .with_state(state);
     public.merge(protected)
+}
+
+/// `GET /metrics` — Prometheus exposition (`docs/06`).
+async fn metrics(State(state): State<AppState>) -> axum::response::Response {
+    // The repository may not exist yet (nothing has been backed up); that is
+    // not an error for a metrics scrape.
+    let repo_bytes = match crate::repo::open_or_init(state.catalog_path()).await {
+        Ok(repo) => repo.stats().await.ok().map(|s| s.bytes_stored),
+        Err(_) => None,
+    };
+    let body = crate::metrics::render(&state.catalog, repo_bytes).await;
+    (
+        axum::http::StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        body,
+    )
+        .into_response()
 }
 
 /// Bearer-token middleware: resolves the session user or answers 401.
@@ -466,7 +493,10 @@ pub struct TriggerRequest {
     /// Absolute remote paths to back up.
     pub paths: Vec<String>,
     /// Repository location (local path or sftp:// URL), as in the CLI.
-    pub repo: String,
+    /// Omit to use the control plane's own repository (`AEGIS_REPO`, else the
+    /// catalog's directory).
+    #[serde(default)]
+    pub repo: Option<String>,
     /// Use agent mode (`docs/04`): auto-push the agent binary over SSH and
     /// run the backup on the target. Falls back to agentless when the target
     /// cannot run it. Default: agentless.
@@ -479,6 +509,31 @@ struct TriggerResponse {
     snapshot_id: String,
     files: u64,
     new_chunks: u64,
+}
+
+/// Auth for an `sftp://` repository the control plane writes to: the password
+/// the process was given, else the default key files in `$HOME/.ssh`.
+fn sftp_repo_auth() -> Result<aegis_core::SftpAuth, ApiError> {
+    use aegis_core::sftp::SftpAuth;
+    if let Ok(password) = std::env::var("AEGIS_SSH_PASSWORD") {
+        return Ok(SftpAuth::Password(password));
+    }
+    let home = std::env::var("HOME")
+        .ok()
+        .or_else(|| std::env::var("USERPROFILE").ok())
+        .ok_or_else(|| ApiError::internal("no SFTP auth for the repository location"))?;
+    for name in ["id_ed25519", "id_rsa"] {
+        let path = std::path::PathBuf::from(&home).join(".ssh").join(name);
+        if path.exists() {
+            return Ok(SftpAuth::KeyFile {
+                path,
+                key_passphrase: None,
+            });
+        }
+    }
+    Err(ApiError::internal(
+        "no SFTP auth for the repository location",
+    ))
 }
 
 async fn trigger(
@@ -522,45 +577,35 @@ async fn trigger(
     // itself; AEGIS_PASSPHRASE doubles as the repo passphrase here).
     let pass = std::env::var("AEGIS_PASSPHRASE")
         .map_err(|_| ApiError::internal("AEGIS_PASSPHRASE is required"))?;
-    let backend: Box<dyn aegis_core::Backend> = match aegis_core::sftp::parse_location(&req.repo)
-        .map_err(|e| ApiError::bad_request(format!("{e}")))?
-    {
-        aegis_core::sftp::RepoLocation::Local(path) => {
-            Box::new(aegis_core::LocalBackend::new(path))
-        }
-        aegis_core::sftp::RepoLocation::Sftp(target) => {
-            // The server-side repo SFTP auth uses the same env fallbacks the
-            // CLI uses; key-file default first, then AEGIS_SSH_PASSWORD.
-            let sftp_auth = if let Ok(password) = std::env::var("AEGIS_SSH_PASSWORD") {
-                SftpAuth::Password(password)
-            } else if let Some(home) = std::env::var("HOME")
-                .ok()
-                .or_else(|| std::env::var("USERPROFILE").ok())
-            {
-                let mut found = None;
-                for name in ["id_ed25519", "id_rsa"] {
-                    let p = std::path::PathBuf::from(&home).join(".ssh").join(name);
-                    if p.exists() {
-                        found = Some(SftpAuth::KeyFile {
-                            path: p,
-                            key_passphrase: None,
-                        });
-                        break;
+    // No `repo` in the request: the control plane's own repository.
+    let repo_location = req.repo.clone().unwrap_or_else(|| {
+        crate::repo::repo_path(state.catalog_path())
+            .display()
+            .to_string()
+    });
+    let repo = match req.repo.as_deref() {
+        // An explicit location: open it, creating a local one if it is new.
+        Some(location) => {
+            let backend: Box<dyn aegis_core::Backend> =
+                match aegis_core::sftp::parse_location(location)
+                    .map_err(|e| ApiError::bad_request(format!("{e}")))?
+                {
+                    aegis_core::sftp::RepoLocation::Local(path) => {
+                        Box::new(aegis_core::LocalBackend::new(path))
                     }
-                }
-                found
-                    .ok_or_else(|| ApiError::internal("no SFTP auth for the repository location"))?
-            } else {
-                return Err(ApiError::internal(
-                    "no SFTP auth for the repository location",
-                ));
-            };
-            Box::new(aegis_core::sftp::SftpBackend::new(target, sftp_auth))
+                    aegis_core::sftp::RepoLocation::Sftp(target) => Box::new(
+                        aegis_core::sftp::SftpBackend::new(target, sftp_repo_auth()?),
+                    ),
+                };
+            crate::repo::open_backend_or_init(backend, &pass)
+                .await
+                .map_err(|e| ApiError::bad_request(e.to_string()))?
         }
+        // No `repo` in the request: the control plane's own repository.
+        None => crate::repo::open_or_init(state.catalog_path())
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?,
     };
-    let repo = aegis_core::Repository::open(backend, &pass)
-        .await
-        .map_err(|e| ApiError::bad_request(format!("opening repository: {e}")))?;
 
     let ssh = aegis_core::ssh::SshManager::new();
     let snapshot = if req.agent {
@@ -568,9 +613,16 @@ async fn trigger(
         // target cannot run the agent (restricted shell, unknown platform).
         let bin_dir = std::env::var("AEGIS_AGENT_BIN_DIR")
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("target/aegis-agent"));
-        match aegis_core::agent::push_and_run(&ssh, &cfg, &bin_dir, &req.repo, &pass, &req.paths)
-            .await
+            .unwrap_or_else(|_| std::path::PathBuf::from("/usr/local/bin"));
+        match aegis_core::agent::push_and_run(
+            &ssh,
+            &cfg,
+            &bin_dir,
+            &repo_location,
+            &pass,
+            &req.paths,
+        )
+        .await
         {
             Ok(line) => {
                 // The agent committed the snapshot itself into the repo the
@@ -583,6 +635,15 @@ async fn trigger(
                 let _ = state
                     .catalog
                     .audit(Some(&user.id), "job.run.agent", Some(&req.host_id))
+                    .await;
+                let size = repo
+                    .find_snapshot(&id)
+                    .await
+                    .map(|s| s.stats.bytes as i64)
+                    .unwrap_or(0);
+                let _ = state
+                    .catalog
+                    .record_snapshot(&id, &req.host_id, "", &repo_location, size)
                     .await;
                 return Ok(Json(TriggerResponse {
                     snapshot_id: id,
@@ -611,6 +672,16 @@ async fn trigger(
     let _ = state
         .catalog
         .set_host_status(&req.host_id, aegis_core::catalog::HostStatus::Reachable)
+        .await;
+    let _ = state
+        .catalog
+        .record_snapshot(
+            &snapshot.id,
+            &req.host_id,
+            "",
+            &repo_location,
+            snapshot.stats.bytes as i64,
+        )
         .await;
     let _ = state
         .catalog
@@ -776,6 +847,130 @@ async fn remove_policy(
         .audit(Some(&user.id), "policy.remove", Some(&id))
         .await;
     Ok(Json(serde_json::json!({ "id": id, "removed": true })))
+}
+
+/// `GET /api/hosts/:id/snapshots` — snapshots recorded for one host.
+async fn host_snapshots(
+    State(state): State<AppState>,
+    UrlPath(id): UrlPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    // 404 rather than an empty list when the host itself is unknown.
+    state
+        .catalog
+        .get_host(&id)
+        .await
+        .map_err(|_| ApiError::not_found(format!("host `{id}` not found")))?;
+    let snapshots = state
+        .catalog
+        .list_snapshots_for_host(Some(&id), 200)
+        .await?;
+    Ok(Json(serde_json::json!(snapshots
+        .iter()
+        .map(|s| serde_json::json!({
+            "id": s.id,
+            "host_id": s.host_id,
+            "job_id": s.job_id,
+            "repo": s.repo_ref,
+            "size_bytes": s.size_bytes,
+            "created_at": s.created_at,
+        }))
+        .collect::<Vec<_>>())))
+}
+
+/// `POST /api/restore` ⇔ `aegis restore --snapshot <id> --target <dir>`.
+/// `path` is optional: empty restores the whole snapshot.
+#[derive(Deserialize)]
+pub struct RestoreRequest {
+    /// Snapshot id, or any unambiguous prefix of one.
+    pub snapshot_id: String,
+    /// Local directory to restore into; created if missing.
+    pub target: String,
+    /// Path inside the snapshot; empty or omitted restores everything.
+    #[serde(default)]
+    pub path: String,
+}
+
+async fn restore(
+    State(state): State<AppState>,
+    axum::Extension(user): axum::Extension<User>,
+    Json(req): Json<RestoreRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_min_role(&user, Role::Operator)?;
+    let repo = crate::repo::open_or_init(state.catalog_path())
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let snapshot = repo
+        .restore_path(&req.snapshot_id, &req.path, &req.target)
+        .await
+        .map_err(|e| match e {
+            aegis_core::Error::SnapshotNotFound(_) => {
+                ApiError::not_found(format!("no snapshot matches `{}`", req.snapshot_id))
+            }
+            aegis_core::Error::InvalidInput(m) => ApiError::bad_request(m),
+            other => ApiError::internal(format!("restore failed: {other}")),
+        })?;
+    let _ = state
+        .catalog
+        .audit(
+            Some(&user.id),
+            "snapshot.restore",
+            Some(&format!("{} -> {}", snapshot.id, req.target)),
+        )
+        .await;
+    Ok(Json(serde_json::json!({
+        "snapshot_id": snapshot.id,
+        "target": req.target,
+        "files": snapshot.count_files(),
+    })))
+}
+
+/// `GET /api/stats` ⇔ `aegis stats` — repository storage and dedup numbers.
+async fn stats(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let repo = crate::repo::open_or_init(state.catalog_path())
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let stats = repo
+        .stats()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(
+        serde_json::to_value(stats).unwrap_or(serde_json::Value::Null),
+    ))
+}
+
+/// `GET /api/alerts` — recent failures: failed jobs plus hosts that could not
+/// be reached the last time they were tried.
+async fn alerts(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let jobs = state
+        .catalog
+        .list_jobs(None, None, Some("failed"), 20, 0)
+        .await?;
+    let hosts = state.catalog.list_hosts().await?;
+    let mut out: Vec<serde_json::Value> = jobs
+        .iter()
+        .map(|j| {
+            serde_json::json!({
+                "kind": "job_failed",
+                "id": j.id,
+                "host_id": j.host_id,
+                "at": j.finished_at.unwrap_or(j.started_at),
+                "message": j.error.clone().unwrap_or_else(|| "job failed".into()),
+            })
+        })
+        .collect();
+    for h in hosts
+        .iter()
+        .filter(|h| h.status == aegis_core::HostStatus::Unreachable)
+    {
+        out.push(serde_json::json!({
+            "kind": "host_unreachable",
+            "id": h.id,
+            "host_id": h.id,
+            "at": 0,
+            "message": format!("host `{}` was unreachable on its last run", h.name),
+        }));
+    }
+    Ok(Json(serde_json::json!(out)))
 }
 
 /// Uniform JSON error responses.

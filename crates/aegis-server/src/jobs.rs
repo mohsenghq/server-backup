@@ -10,7 +10,6 @@ use std::path::Path;
 use std::sync::Arc;
 
 use aegis_core::catalog::{Catalog, HostWithKey};
-use aegis_core::repo::Repository;
 use aegis_core::ssh::SshManager;
 use anyhow::Result;
 use serde::Serialize;
@@ -85,15 +84,20 @@ pub async fn start(
 ) -> Result<Sender> {
     let (tx, _rx) = broadcast::channel::<JobTask>(concurrency * 2);
     let tx = Arc::new(tx);
+    let notifier = crate::notify::Notifier::from_env();
+    if notifier.is_empty() {
+        tracing::debug!("no notification targets configured");
+    }
     for _ in 0..concurrency {
         let cat = catalog.clone();
         let mk = master_key;
         let cpath = catalog_path.clone();
         let ev = events.clone();
+        let n = notifier.clone();
         let mut rx = tx.subscribe();
         tokio::spawn(async move {
             while let Ok(task) = rx.recv().await {
-                run_task(cat.clone(), mk, &cpath, task, ev.clone()).await;
+                run_task(cat.clone(), mk, &cpath, task, ev.clone(), n.clone()).await;
             }
         });
     }
@@ -121,6 +125,7 @@ async fn run_task(
     catalog_path: &Path,
     task: JobTask,
     events: EventHub,
+    notifier: crate::notify::Notifier,
 ) {
     let job_id = Uuid::new_v4().to_string();
     if let Err(e) = catalog
@@ -139,10 +144,10 @@ async fn run_task(
         bytes_total: None,
         error: None,
     });
-    let result = async {
+    let outcome = async {
         let ssh = SshManager::new();
         let cfg = build_host_config(&task.host_id, &master_key, &catalog).await?;
-        let repo = open_repo(catalog_path, &master_key).await?;
+        let repo = crate::repo::open_or_init(catalog_path).await?;
         let chunker = repo.config().chunker;
         let paths: Vec<String> = serde_json::from_str(&task.paths_json)
             .map_err(|e| anyhow::anyhow!("parse policy paths: {e}"))?;
@@ -162,30 +167,44 @@ async fn run_task(
                 snapshot.stats.bytes as i64,
             )
             .await?;
-        events.publish(JobEvent {
-            event: "completed".into(),
-            job_id: job_id.clone(),
-            host_id: task.host_id.clone(),
-            policy_id: task.policy_id.clone(),
-            bytes_new: Some(snapshot.stats.new_bytes as i64),
-            bytes_total: Some(snapshot.stats.bytes as i64),
-            error: None,
-        });
-        Ok::<_, anyhow::Error>(())
+        let _ = catalog
+            .record_snapshot(
+                &snapshot.id,
+                &task.host_id,
+                &job_id,
+                &repo.backend().describe(),
+                snapshot.stats.bytes as i64,
+            )
+            .await;
+        Ok::<_, anyhow::Error>(snapshot)
     }
     .await;
-    if let Err(e) = result {
-        let _ = catalog.record_job_failed(&job_id, &e.to_string()).await;
-        events.publish(JobEvent {
-            event: "failed".into(),
+    // One terminal event per run: notify the outside world, then the UI.
+    let event = match outcome {
+        Ok(snapshot) => JobEvent {
+            event: "completed".into(),
             job_id,
             host_id: task.host_id,
             policy_id: task.policy_id,
-            bytes_new: None,
-            bytes_total: None,
-            error: Some(e.to_string()),
-        });
-    }
+            bytes_new: Some(snapshot.stats.new_bytes as i64),
+            bytes_total: Some(snapshot.stats.bytes as i64),
+            error: None,
+        },
+        Err(e) => {
+            let _ = catalog.record_job_failed(&job_id, &e.to_string()).await;
+            JobEvent {
+                event: "failed".into(),
+                job_id,
+                host_id: task.host_id,
+                policy_id: task.policy_id,
+                bytes_new: None,
+                bytes_total: None,
+                error: Some(e.to_string()),
+            }
+        }
+    };
+    notifier.job_finished(&event).await;
+    events.publish(event);
 }
 
 async fn build_host_config(
@@ -209,13 +228,4 @@ async fn build_host_config(
         aegis_core::ssh::HostConfig::new(h.ssh_user.clone(), h.address.clone(), auth)
             .with_port(h.ssh_port),
     )
-}
-
-async fn open_repo(catalog_path: &Path, _master_key: &[u8; 32]) -> Result<Repository> {
-    let pass = std::env::var("AEGIS_PASSPHRASE")
-        .map_err(|_| anyhow::anyhow!("AEGIS_PASSPHRASE is required"))?;
-    let backend = Box::new(aegis_core::backend::LocalBackend::new(catalog_path));
-    Repository::open(backend, &pass)
-        .await
-        .map_err(|e| anyhow::anyhow!("opening repository: {e}"))
 }

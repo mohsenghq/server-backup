@@ -1,0 +1,39 @@
+# Aegis control plane.
+#
+#   cp .env.example .env   # then edit AEGIS_PASSPHRASE
+#   docker compose up -d --build
+#   open http://localhost:8080
+#
+# All state (catalog, its key sidecar, repositories, ssh known_hosts) lives in
+# the `aegis-data` volume mounted at /data. Back that volume up: losing the
+# catalog key file means losing the stored host keys.
+
+services:
+  aegis:
+    build:
+      context: .
+    image: aegis:local
+    container_name: aegis
+    restart: unless-stopped
+    ports:
+      # Bound to loopback by default; put a TLS terminator in front to expose it.
+      - "${AEGIS_BIND:-127.0.0.1}:8080:8080"
+    environment:
+      # Required. Wraps the catalog master key (keys/<slot>.json) — see docs/10.
+      AEGIS_PASSPHRASE: ${AEGIS_PASSPHRASE:?set AEGIS_PASSPHRASE in .env}
+      # Concurrent backup workers in the job pool.
+      AEGIS_CONCURRENCY: ${AEGIS_CONCURRENCY:-4}
+      # Password auth fallback for hosts added without a stored SSH key.
+      AEGIS_SSH_PASSWORD: ${AEGIS_SSH_PASSWORD:-}
+      # Outbound notifications (webhook / Telegram) on job completion.
+      AEGIS_WEBHOOK_URL: ${AEGIS_WEBHOOK_URL:-}
+      AEGIS_TELEGRAM_BOT_TOKEN: ${AEGIS_TELEGRAM_BOT_TOKEN:-}
+      AEGIS_TELEGRAM_CHAT_ID: ${AEGIS_TELEGRAM_CHAT_ID:-}
+      RUST_LOG: ${RUST_LOG:-aegis_server=info,aegis_core=info}
+    volumes:
+      - aegis-data:/data
+      # Back up paths to read over SSH are mounted read-only here, if wanted:
+      # - ./data:/srv:ro
+
+volumes:
+  aegis-data:

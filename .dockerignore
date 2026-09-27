@@ -1,0 +1,12 @@
+target/
+it-data/
+.git/
+.github/
+docs/
+crates/aegis-web/node_modules/
+crates/aegis-web/dist/
+crates/aegis-web/src-tauri/target/
+crates/aegis-web/src-tauri/gen/
+*.db
+*.db.key.json
+.env

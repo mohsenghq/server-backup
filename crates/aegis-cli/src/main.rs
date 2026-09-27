@@ -199,10 +199,43 @@ enum Command {
         deep: bool,
     },
 
+    /// Show what a repository costs and how much duplication it saves.
+    Stats {
+        /// Repository to inspect.
+        #[arg(long, value_name = "LOCATION")]
+        repo: String,
+    },
+
+    /// Inspect the job history in the catalog.
+    #[command(subcommand)]
+    Job(JobCommand),
+
     /// Manage the host inventory (the catalog). First use creates the
     /// catalog and its master key.
     #[command(subcommand)]
     Host(HostCommand),
+}
+
+#[derive(Subcommand)]
+enum JobCommand {
+    /// List recorded backup jobs, newest first.
+    List {
+        /// Path to the catalog database.
+        #[arg(long, value_name = "FILE", default_value = "aegis-catalog.db")]
+        catalog: PathBuf,
+
+        /// Only jobs for this host (id or name prefix).
+        #[arg(long, value_name = "HOST")]
+        host: Option<String>,
+
+        /// Only jobs with this status (`running`, `completed`, `failed`).
+        #[arg(long, value_name = "STATUS")]
+        status: Option<String>,
+
+        /// Maximum rows to print.
+        #[arg(long, value_name = "N", default_value_t = 20)]
+        limit: i64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -598,6 +631,59 @@ async fn main() -> Result<()> {
                     report.chunks,
                     report.tree_blobs
                 );
+            });
+        }
+
+        Command::Stats { repo } => {
+            let r = open(&cli.ssh, &repo).await?;
+            let stats = r.stats().await.context("collecting repository stats")?;
+            emit(cli.json, &stats, || {
+                println!("repository   {}", stats.repo);
+                println!("snapshots    {}", stats.snapshots);
+                println!("stored       {}", human_bytes(stats.bytes_stored));
+                println!("logical      {}", human_bytes(stats.bytes_logical));
+                println!("written      {}", human_bytes(stats.bytes_written));
+                println!("dedup        {:.1}%", stats.dedup_ratio * 100.0);
+            });
+        }
+
+        Command::Job(JobCommand::List {
+            catalog,
+            host,
+            status,
+            limit,
+        }) => {
+            let handle = hosts::CatalogHandle::open(&catalog).await?;
+            // `host` accepts an id prefix, so resolve it to a full id first.
+            let host_id = match host {
+                Some(h) => Some(hosts::find_host(&handle, &h).await?.id),
+                None => None,
+            };
+            let jobs = handle
+                .catalog
+                .list_jobs(host_id.as_deref(), None, status.as_deref(), limit, 0)
+                .await
+                .context("listing jobs")?;
+            emit(cli.json, &jobs, || {
+                if jobs.is_empty() {
+                    println!("no jobs recorded");
+                    return;
+                }
+                println!(
+                    "{:<10}  {:<20}  {:<10}  {:>10}  {:>10}  ERROR",
+                    "ID", "STARTED", "STATUS", "NEW", "TOTAL"
+                );
+                for j in &jobs {
+                    println!(
+                        "{:<10}  {:<20}  {:<10}  {:>10}  {:>10}  {}",
+                        &j.id[..8.min(j.id.len())],
+                        j.started_at,
+                        j.status,
+                        human_bytes(j.bytes_new.max(0) as u64),
+                        human_bytes(j.bytes_total.max(0) as u64),
+                        j.error.as_deref().unwrap_or("")
+                    );
+                }
             });
         }
 

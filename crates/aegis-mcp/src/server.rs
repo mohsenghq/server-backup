@@ -46,15 +46,19 @@ pub struct HostIdRequest {
 pub struct TriggerBackupRequest {
     #[schemars(description = "Host id or name prefix")]
     pub host_id: String,
+    #[schemars(description = "Absolute remote paths to back up, e.g. /etc")]
+    pub paths: Vec<String>,
+    #[schemars(
+        description = "Repository location (optional; defaults to the server's own repository)"
+    )]
+    pub repo: Option<String>,
     #[schemars(description = "Run via the on-host agent if installed (optional, default false)")]
     pub agent: Option<bool>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct RestorePathRequest {
-    #[schemars(description = "Host id or name prefix")]
-    pub host_id: String,
-    #[schemars(description = "Snapshot id")]
+    #[schemars(description = "Snapshot id (from list_snapshots); ids are unique per repository")]
     pub snapshot_id: String,
     #[schemars(description = "Path inside the snapshot to restore")]
     pub remote_path: String,
@@ -86,11 +90,10 @@ impl AegisMcpServer {
             port,
         }): Parameters<AddHostRequest>,
     ) -> Result<CallToolResult, McpError> {
-        let mut payload = json!({ "name": name, "address": address, "user": user });
-        if let Some(port) = port {
-            payload["port"] = json!(port);
-        }
-        self.json_result(self.client.add_host(payload).await, "add_host")
+        self.json_result(
+            self.client.add_host(&name, &address, &user, port).await,
+            "add_host",
+        )
     }
 
     #[tool(
@@ -106,11 +109,16 @@ impl AegisMcpServer {
     #[tool(description = "Trigger a backup for a host now.")]
     async fn trigger_backup(
         &self,
-        Parameters(TriggerBackupRequest { host_id, agent }): Parameters<TriggerBackupRequest>,
+        Parameters(TriggerBackupRequest {
+            host_id,
+            paths,
+            repo,
+            agent,
+        }): Parameters<TriggerBackupRequest>,
     ) -> Result<CallToolResult, McpError> {
         self.json_result(
             self.client
-                .trigger_backup(&host_id, agent.unwrap_or(false))
+                .trigger_backup(&host_id, &paths, repo.as_deref(), agent.unwrap_or(false))
                 .await,
             "trigger_backup",
         )
@@ -133,17 +141,15 @@ impl AegisMcpServer {
     async fn restore_path(
         &self,
         Parameters(RestorePathRequest {
-            host_id,
             snapshot_id,
             remote_path,
             destination,
         }): Parameters<RestorePathRequest>,
     ) -> Result<CallToolResult, McpError> {
         let payload = json!({
-            "host_id": host_id,
             "snapshot_id": snapshot_id,
             "path": remote_path,
-            "destination": destination,
+            "target": destination,
         });
         self.json_result(self.client.restore_path(payload).await, "restore_path")
     }

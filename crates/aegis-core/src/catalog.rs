@@ -645,6 +645,100 @@ impl Catalog {
             .map_err(|e| Error::Catalog(format!("listing jobs: {e}")))?;
         rows.iter().map(job_from_row).collect()
     }
+
+    /// Record a committed snapshot against the host and job that produced it.
+    /// Re-recording the same snapshot id is a no-op (the id is the key), so
+    /// retried jobs cannot duplicate history.
+    pub async fn record_snapshot(
+        &self,
+        snapshot_id: &str,
+        host_id: &str,
+        job_id: &str,
+        repo_ref: &str,
+        size_bytes: i64,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO snapshots (id, host_id, job_id, repo_ref, size_bytes, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(snapshot_id)
+        .bind(host_id)
+        .bind(job_id)
+        .bind(repo_ref)
+        .bind(size_bytes)
+        .bind(now_secs())
+        .execute(&self.pool)
+        .await
+        .map_err(|e| Error::Catalog(format!("recording snapshot: {e}")))?;
+        Ok(())
+    }
+
+    /// List snapshots for one host, newest first. `host_id = None` lists every
+    /// recorded snapshot.
+    pub async fn list_snapshots_for_host(
+        &self,
+        host_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<SnapshotRecord>> {
+        let mut sql = String::from(
+            "SELECT id, host_id, job_id, repo_ref, size_bytes, created_at FROM snapshots WHERE 1=1",
+        );
+        if host_id.is_some() {
+            sql.push_str(" AND host_id = ?");
+        }
+        sql.push_str(" ORDER BY created_at DESC LIMIT ?");
+        let mut query = sqlx::query(&sql);
+        if let Some(h) = host_id {
+            query = query.bind(h);
+        }
+        let rows = query
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| Error::Catalog(format!("listing snapshots: {e}")))?;
+        rows.iter()
+            .map(|row| {
+                Ok(SnapshotRecord {
+                    id: row
+                        .try_get("id")
+                        .map_err(|e| Error::Catalog(format!("reading snapshot id: {e}")))?,
+                    host_id: row
+                        .try_get("host_id")
+                        .map_err(|e| Error::Catalog(format!("reading snapshot host_id: {e}")))?,
+                    job_id: row
+                        .try_get("job_id")
+                        .map_err(|e| Error::Catalog(format!("reading snapshot job_id: {e}")))?,
+                    repo_ref: row
+                        .try_get("repo_ref")
+                        .map_err(|e| Error::Catalog(format!("reading snapshot repo_ref: {e}")))?,
+                    size_bytes: row
+                        .try_get("size_bytes")
+                        .map_err(|e| Error::Catalog(format!("reading snapshot size_bytes: {e}")))?,
+                    created_at: row
+                        .try_get("created_at")
+                        .map_err(|e| Error::Catalog(format!("reading snapshot created_at: {e}")))?,
+                })
+            })
+            .collect()
+    }
+}
+
+/// A snapshot recorded in the catalog (`docs/05`), one row per committed
+/// snapshot: which host produced it, under which job, into which repository.
+#[derive(Debug, Clone, Serialize)]
+pub struct SnapshotRecord {
+    /// Snapshot id as written in the repository's manifest.
+    pub id: String,
+    /// Host the snapshot was taken from.
+    pub host_id: String,
+    /// Job that produced it (empty for snapshots recorded outside the pool).
+    pub job_id: String,
+    /// Repository location the snapshot lives in.
+    pub repo_ref: String,
+    /// Logical size of the snapshot's source data in bytes.
+    pub size_bytes: i64,
+    /// Seconds since Unix epoch.
+    pub created_at: i64,
 }
 
 /// A job record from the catalog.

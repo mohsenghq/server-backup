@@ -15,6 +15,9 @@ pub struct AppState {
     pub catalog: Catalog,
     /// Live job events (WebSocket broadcast hub).
     pub events: EventHub,
+    /// Where the catalog lives; the control plane's repository defaults to the
+    /// same directory (see [`crate::repo`]).
+    path: std::path::PathBuf,
     master_key: [u8; 32],
 }
 
@@ -58,8 +61,14 @@ impl AppState {
         Ok(Self {
             catalog,
             events: EventHub::default(),
+            path: path.to_path_buf(),
             master_key,
         })
+    }
+
+    /// Where the catalog file lives.
+    pub fn catalog_path(&self) -> &std::path::Path {
+        &self.path
     }
 
     /// The unwrapped catalog master key (for sealing host keys).
