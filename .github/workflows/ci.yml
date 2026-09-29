@@ -7,7 +7,9 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
+  # No global RUSTFLAGS=-D warnings: it reaches dependencies too, so a warning
+  # in a third-party crate would fail the build. The `lint` job is the warning
+  # gate, where `-D warnings` applies to workspace crates only.
 
 jobs:
   test:
@@ -46,7 +48,10 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # aegis-desktop is excluded here exactly as in the test job: its
+      # cdylib needs Tauri's system libraries (glib/webkit2gtk), which only
+      # the `desktop` job installs.
+      - run: cargo clippy --workspace --exclude aegis-desktop --all-targets -- -D warnings
 
   # The benchmark suite must always compile and run; criterion baselines are
   # not persisted across runs (no dedicated bench runner), so this job acts
@@ -64,7 +69,7 @@ jobs:
           # Benchmarks need the optimized build of every dependency; cache
           # them separately from the test job's debug artifacts.
           key: bench
-      - run: cargo bench --workspace --no-run
+      - run: cargo bench --workspace --exclude aegis-desktop --no-run
       - name: Smoke-run benchmarks (reduced sampling)
         run: cargo bench -p aegis-core --bench bench -- --warm-up-time 0.2 --measurement-time 0.8
 
@@ -102,21 +107,33 @@ jobs:
         run: cargo build -p aegis-server -p aegis-cli
       - name: Start aegis-server with an in-process SSH target
         run: |
-          ./scripts/e2e-harness.sh &
-          sleep 5
+          bash scripts/e2e-harness.sh &
+          # The harness does two Argon2id derivations per process before it
+          # listens, so poll /health instead of sleeping a guessed interval.
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1; then
+              echo "server is up after ${i}s"; exit 0
+            fi
+            sleep 1
+          done
+          echo "aegis-server never became healthy" >&2
+          exit 1
         env:
           AEGIS_PASSPHRASE: e2e-passphrase
       - name: Run Playwright
         working-directory: crates/aegis-web
+        # No `playwright install`: the config drives the system Chrome
+        # (`channel: 'chrome'`), which the ubuntu runner image ships.
         run: |
           npm ci || npm install
-          npx playwright install chromium --with-deps || npx playwright install chromium
           npx playwright test
         env:
           CI: "1"
           AEGIS_E2E_API: http://127.0.0.1:8080
           AEGIS_E2E_SSH_PORT: 2222
-          AEGIS_E2E_SSH_USER: aegis
+          # The in-process sshd only accepts this user (aegis-core's
+          # tests/sftp_server.rs harness); any other name fails auth.
+          AEGIS_E2E_SSH_USER: aegis-test
           AEGIS_E2E_PATHS: /srv/backup-me
           AEGIS_E2E_REPO: /tmp/aegis-e2e-repo
 
@@ -144,6 +161,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev
+      - name: Install web dependencies
+        working-directory: crates/aegis-web
+        # build-desktop.sh runs `npm run build` (tsc + vite) and `npx tauri
+        # build`; without node_modules both fail on a clean checkout.
+        run: npm ci || npm install
       - name: Build desktop bundle
         run: bash scripts/build-desktop.sh
         env:
@@ -152,7 +174,7 @@ jobs:
         if: runner.os == 'Linux'
         with:
           name: aegis-desktop-linux
-          path: target/release/bundle/*/Aegis*.{AppImage,deb}
+          path: target/release/bundle/*/*.{AppImage,deb}
           if-no-files-found: warn
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Windows'

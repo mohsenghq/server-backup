@@ -10,8 +10,8 @@ services:
     ports:
       - "2222:2222"
     environment:
-      - PASSWORD_ACCESS=aegis-test-password
+      - PASSWORD_ACCESS=true
       - USER_NAME=aegis
-      - USER_PASSWORD_ACCESS=true
+      - USER_PASSWORD=aegis-test-password
     volumes:
       - ./it-data:/data

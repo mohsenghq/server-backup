@@ -61,9 +61,9 @@ Static plan — what "done" means for each phase. Work top to bottom, in order. 
 
 - [x] `aegis-mcp` server (`rmcp`), tools per `docs/09-mcp-server.md`
 - [x] Multi-backend replication
-- [ ] Key rotation / re-key flow
+- [x] Key rotation / re-key flow
 - [x] RBAC / multi-user roles
-- [ ] Audit log viewer
+- [x] Audit log viewer
 - [x] Bandwidth throttling
 - [ ] (stretch) FUSE mount browsing of snapshots
 

@@ -259,6 +259,9 @@ impl SshManager {
         let sftp = SftpSession::new(channel.into_stream())
             .await
             .map_err(|e| Error::Ssh(format!("starting SFTP protocol: {e}")))?;
+        // russh-sftp's 10 s default request timeout aborts long agentless
+        // backups on a WAN link; see `sftp::SFTP_REQUEST_TIMEOUT_SECS`.
+        sftp.set_timeout(crate::sftp::SFTP_REQUEST_TIMEOUT_SECS);
         Ok(Arc::new(sftp))
     }
 }

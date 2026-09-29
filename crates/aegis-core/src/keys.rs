@@ -19,6 +19,20 @@ use crate::error::{Error, Result};
 /// and tree nodes additionally bind their own hash (see `AeadContext`).
 pub const DOC_CONTEXT: &[u8] = b"aegis/doc/v1";
 
+/// Where wrapped master keys live in the repository key space.
+const KEYS_PREFIX: &str = "keys";
+
+fn key_key(slot: &str) -> String {
+    format!("{KEYS_PREFIX}/{slot}.json")
+}
+
+/// The slot name of a key file's key, if `key` is one (`"keys/key1.json"` →
+/// `"key1"`).
+fn slot_of(key: &str) -> Option<&str> {
+    key.strip_prefix("keys/")
+        .and_then(|rest| rest.strip_suffix(".json"))
+}
+
 /// The `keys/` document, stored in plaintext JSON: it contains only wrapped
 /// material, salts, and parameters.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,11 +171,72 @@ pub fn load_new_passphrase() -> Result<String> {
     load_passphrase(&PassphraseSource::Prompt { confirm: true })
 }
 
+/// Unwrap the master key of whichever slot `passphrase` opens.
+///
+/// The configured slot from `config.key_slot` is tried first, then every other
+/// slot in the repository. Rotation adds slots, so a repository is openable by
+/// *any* of its passphrases, not just the one `config` happened to name — and
+/// deleting a key slot must not be able to strand the repository.
+///
+/// Returns the slot that was opened along with its crypto.
+///
+/// # Errors
+///
+/// Returns [`Error::KeyError`] if no key file can be read, and
+/// [`Error::WrongPassphrase`] when `passphrase` opens none of them.
+pub async fn open_any_slot(
+    backend: &dyn crate::backend::Backend,
+    config: &crate::repo::RepoConfig,
+    passphrase: &str,
+) -> Result<(String, RepoCrypto)> {
+    let mut slots = vec![config.key_slot.clone()];
+    for key in backend.list(KEYS_PREFIX).await? {
+        if let Some(slot) = slot_of(&key) {
+            if !slots.iter().any(|s| s == slot) {
+                slots.push(slot.to_string());
+            }
+        }
+    }
+    let mut last = Error::KeyError("repository has no key files".into());
+    for slot in slots {
+        let Ok(raw) = backend.get(&key_key(&slot)).await else {
+            continue;
+        };
+        let Ok(file) = KeyFile::from_json(&raw) else {
+            continue;
+        };
+        match RepoCrypto::from_key_file(&file, passphrase) {
+            Ok(crypto) => return Ok((file.slot, crypto)),
+            // The passphrase may open another slot; remember the failure in
+            // case it opens none of them.
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// One passphrase slot in a repository's `keys/` directory, as reported by
+/// [`key_list_backend`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeySlot {
+    /// Slot name, and the key file's filename stem (`default`, `key1`, …).
+    pub slot: String,
+    /// RFC 3339 timestamp of when this slot was created.
+    pub created: String,
+    /// Argon2id parameters protecting this slot's wrapped key.
+    pub kdf: KdfParams,
+    /// Whether this is the slot the repository `config` names. Slots other
+    /// than this one still open the repository — see [`open_any_slot`] — so
+    /// this is a hint, not an access control.
+    pub active: bool,
+}
+
 /// Add a new passphrase that can open the local repository at `path`.
 ///
 /// The existing master key is unwrapped with `current_passphrase`, then
 /// wrapped under `new_passphrase` into the next free `key<N>` slot. Data is
-/// untouched — this is what makes passphrase rotation cheap.
+/// untouched — this is what makes passphrase rotation cheap
+/// (`docs/10-security-model.md`).
 ///
 /// Returns the id of the new key slot.
 ///
@@ -192,33 +267,122 @@ pub async fn key_add_backend(
     current_passphrase: &str,
     new_passphrase: &str,
 ) -> Result<String> {
-    // Read config only to find the current slot (opening would also do).
-    let raw = backend.get("config").await?;
-    let config: crate::repo::RepoConfig =
-        serde_json::from_slice(&raw).map_err(|e| Error::Malformed {
-            what: "repository config".into(),
-            source: e,
-        })?;
-    let file = KeyFile::from_json(
-        &backend
-            .get(&format!("keys/{}.json", config.key_slot))
-            .await?,
-    )?;
-    let crypto = RepoCrypto::from_key_file(&file, current_passphrase)?;
+    let config = read_config(backend.as_ref()).await?;
+    // Any passphrase that opens the repo may authorize adding another one, not
+    // just the one the config happens to name.
+    let (slot, crypto) = open_any_slot(backend.as_ref(), &config, current_passphrase).await?;
 
     // Next free slot: key1, key2, ... ("default" is slot 0).
     let mut n = 1usize;
-    while backend.exists(&format!("keys/key{n}.json")).await? {
+    while backend.exists(&key_key(&format!("key{n}"))).await? {
         n += 1;
     }
-    let slot = format!("key{n}");
+    let new_slot = format!("key{n}");
     let master = crypto.master_key();
+    // Inherit the opened slot's Argon2id params, so a rotation does not
+    // silently weaken (or needlessly strengthen) a repository's KDF cost.
+    let kdf = KeyFile::from_json(&backend.get(&key_key(&slot)).await?)?
+        .wrapped_key
+        .kdf;
     let (_new_crypto, new_file) =
-        RepoCrypto::new_wrapped(&slot, &master, new_passphrase, &file.wrapped_key.kdf)?;
+        RepoCrypto::new_wrapped(&new_slot, &master, new_passphrase, &kdf)?;
     backend
-        .put(&format!("keys/{slot}.json"), &new_file.to_json()?)
+        .put(&key_key(&new_slot), &new_file.to_json()?)
         .await?;
-    Ok(slot)
+    Ok(new_slot)
+}
+
+/// List the passphrase slots in a repository, in slot-name order.
+///
+/// A key file that cannot be parsed is reported as an error rather than
+/// skipped: an unreadable slot is exactly what an operator rotating keys
+/// needs to know about.
+///
+/// # Errors
+///
+/// Returns [`Error::RepoNotFound`] if there is no `config`, [`Error::Malformed`]
+/// for an unparseable config or key file, and backend errors if `keys/` cannot
+/// be listed.
+pub async fn key_list_backend(backend: &dyn crate::backend::Backend) -> Result<Vec<KeySlot>> {
+    let config = read_config(backend).await?;
+    let mut keys = backend.list(KEYS_PREFIX).await?;
+    keys.sort();
+    let mut out = Vec::with_capacity(keys.len());
+    for key in keys {
+        let Some(slot) = slot_of(&key) else { continue };
+        let file = KeyFile::from_json(&backend.get(&key).await?)?;
+        out.push(KeySlot {
+            slot: file.slot,
+            created: file.wrapped_key.created,
+            kdf: file.wrapped_key.kdf,
+            active: slot == config.key_slot,
+        });
+    }
+    Ok(out)
+}
+
+/// Revoke a passphrase slot, deleting its `keys/<slot>.json` file.
+///
+/// This is the destructive half of rotation: the revoked passphrase can no
+/// longer unwrap the master key, while the repository's data is untouched —
+/// every other slot still opens it. `passphrase` must open the repository, so
+/// revoking a key requires proving you hold a working one.
+///
+/// If the revoked slot is the one the repository `config` names, the config is
+/// re-pointed at a surviving slot, so it never references a slot that is gone.
+///
+/// # Errors
+///
+/// Returns [`Error::KeyError`] if `slot` does not exist or it is the
+/// repository's only remaining slot (which would leave nothing able to open
+/// the repository), [`Error::WrongPassphrase`] if `passphrase` does not open
+/// the repository, and backend errors if the key file cannot be deleted.
+pub async fn key_remove_backend(
+    backend: &dyn crate::backend::Backend,
+    slot: &str,
+    passphrase: &str,
+) -> Result<()> {
+    let mut config = read_config(backend).await?;
+    open_any_slot(backend, &config, passphrase).await?;
+
+    let mut keys = backend.list(KEYS_PREFIX).await?;
+    keys.sort();
+    let slots: Vec<&str> = keys.iter().filter_map(|k| slot_of(k)).collect();
+    if !slots.contains(&slot) {
+        return Err(Error::KeyError(format!(
+            "no key slot '{slot}' in this repository (have: {})",
+            slots.join(", ")
+        )));
+    }
+    if slots.len() == 1 {
+        return Err(Error::KeyError(format!(
+            "refusing to remove '{slot}': it is the repository's only key slot. \
+             add another passphrase with `aegis key-add` first"
+        )));
+    }
+    backend.delete(&key_key(slot)).await?;
+
+    if config.key_slot == slot {
+        config.key_slot = slots
+            .iter()
+            .find(|s| **s != slot)
+            .expect("a slot other than the removed one exists")
+            .to_string();
+        let json = serde_json::to_vec_pretty(&config).expect("RepoConfig is serializable");
+        backend.put("config", &json).await?;
+    }
+    Ok(())
+}
+
+/// Read and parse a repository's plaintext `config` document.
+async fn read_config(backend: &dyn crate::backend::Backend) -> Result<crate::repo::RepoConfig> {
+    if !backend.exists("config").await? {
+        return Err(Error::RepoNotFound(backend.describe()));
+    }
+    serde_json::from_slice(&backend.get("config").await?).map_err(|e| Error::Malformed {
+        what: "repository config".into(),
+        source: e,
+    })
 }
 
 /// Everything needed to seal/open a repository's documents: the master key

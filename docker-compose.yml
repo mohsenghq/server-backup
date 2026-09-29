@@ -17,7 +17,9 @@ services:
     restart: unless-stopped
     ports:
       # Bound to loopback by default; put a TLS terminator in front to expose it.
-      - "${AEGIS_BIND:-127.0.0.1}:8080:8080"
+      # AEGIS_PORT changes the published host port (the container always
+      # listens on 8080) for machines where 8080 is already taken.
+      - "${AEGIS_BIND:-127.0.0.1}:${AEGIS_PORT:-8080}:8080"
     environment:
       # Required. Wraps the catalog master key (keys/<slot>.json) — see docs/10.
       AEGIS_PASSPHRASE: ${AEGIS_PASSPHRASE:?set AEGIS_PASSPHRASE in .env}

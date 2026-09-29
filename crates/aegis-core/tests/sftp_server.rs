@@ -226,6 +226,15 @@ impl SftpFs {
                 attrs.mtime = Some(u32::try_from(d.as_secs()).unwrap_or(u32::MAX));
             }
         }
+        // A real sshd reports the full st_mode in the SFTP `permissions`
+        // field; `set_dir`/`set_regular` below OR the file-type bits into it.
+        // Without this the recorded mode is `S_IFREG` with no permission bits,
+        // which is not what any real server sends.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            attrs.permissions = Some(meta.permissions().mode());
+        }
         attrs.set_dir(meta.is_dir());
         attrs.set_regular(meta.is_file());
         attrs

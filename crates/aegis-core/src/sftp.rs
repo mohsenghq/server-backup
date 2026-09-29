@@ -39,6 +39,15 @@ use crate::chunk::ChunkerConfig;
 use crate::error::{Error, Result};
 use crate::repo::Repository;
 
+/// How long a single SFTP request may take before the session is torn down.
+///
+/// `russh-sftp` defaults to **10 seconds**, which is fine on a LAN and far too
+/// tight over a real WAN link: one retransmit storm or one slow `sftp-server`
+/// and the whole request errors out with a bare `i/o error at <stream>: Timeout`
+/// that aborts a multi-hour backup. Bounded (a dead peer must still fail
+/// eventually) but generous enough for a congested link.
+pub const SFTP_REQUEST_TIMEOUT_SECS: u64 = 120;
+
 /// Where a repository lives, parsed from a location argument.
 #[derive(Clone, Debug)]
 pub enum RepoLocation {
@@ -331,6 +340,7 @@ impl SftpBackend {
         let sftp = SftpSession::new(channel.into_stream())
             .await
             .map_err(|e| Error::Ssh(format!("starting SFTP protocol: {e}")))?;
+        sftp.set_timeout(SFTP_REQUEST_TIMEOUT_SECS);
         Ok(Arc::new(sftp))
     }
 

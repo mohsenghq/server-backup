@@ -83,7 +83,6 @@ fn run(args: &[&str], input: Option<&str>) -> Result<String, String> {
 struct SshdContainer {
     port: u16,
     _data: TempDir,
-    host_key: String,
 }
 
 impl Drop for SshdContainer {
@@ -102,26 +101,6 @@ async fn start_sshd() -> Result<SshdContainer, String> {
     std::fs::write(data.path().join("site/etc/big.bin"), vec![0x42u8; 9000])
         .map_err(|e| e.to_string())?;
 
-    let host_key_path = data.path().join("hostkey");
-    if !host_key_path.exists() {
-        // Generate a stable host key we can pin before first contact.
-        run(
-            &[
-                "run",
-                "--rm",
-                "-v",
-                &format!("{}:/key", host_key_path.display()),
-                "alpine",
-                "sh",
-                "-c",
-                "ssh-keygen -t ed25519 -N '' -f /key/hostkey -q",
-            ],
-            None,
-        )
-        .map_err(|e| format!("generating host key (is openssh-client in alpine? {e})"))?;
-    }
-    let host_key = std::fs::read_to_string(&host_key_path).map_err(|e| e.to_string())?;
-
     // Find a free port by binding then releasing (small race, acceptable
     // for tests).
     let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
@@ -138,36 +117,50 @@ async fn start_sshd() -> Result<SshdContainer, String> {
             &format!("{port}:2222"),
             "-v",
             &format!("{}:{CONTAINER_ROOT}", data.path().display()),
-            "-e",
-            &format!("PASSWORD_ACCESS={PASSWORD}"),
+            // linuxserver/openssh-server: USER_PASSWORD is the account's
+            // password, PASSWORD_ACCESS=true switches password auth on.
+            // (Older releases took the password *in* PASSWORD_ACCESS, which
+            // silently gave the user a random password.)
             "-e",
             &format!("USER_NAME={USER}"),
             "-e",
-            "USER_PASSWORD_ACCESS=true",
+            &format!("USER_PASSWORD={PASSWORD}"),
+            "-e",
+            "PASSWORD_ACCESS=true",
             IMAGE,
         ],
         None,
     )?;
 
-    // Wait for sshd to accept connections.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    // Wait for sshd to actually serve. A published Docker port accepts TCP
+    // connections before the container process is listening, so a successful
+    // `connect` only proves the proxy is up — and the first real connection
+    // then dies with "connection reset by peer". sshd writes its banner
+    // immediately on accept, so wait for that instead.
+    let deadline = std::time::Instant::now() + Duration::from_secs(90);
     loop {
-        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+        if ssh_banner_received(port) {
             break;
         }
         if std::time::Instant::now() > deadline {
-            return Err("sshd container never opened its port".into());
+            return Err("sshd never sent an SSH banner".into());
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    // Give sshd a moment more after the port opens.
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
-    Ok(SshdContainer {
-        port,
-        _data: data,
-        host_key,
-    })
+    Ok(SshdContainer { port, _data: data })
+}
+
+/// True once something on `port` greets us with an `SSH-` identification
+/// string, i.e. sshd is accepting sessions.
+fn ssh_banner_received(port: u16) -> bool {
+    use std::io::Read;
+    let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut buf = [0u8; 4];
+    stream.read_exact(&mut buf).is_ok() && &buf == b"SSH-"
 }
 
 fn fast_kdf() -> aegis_core::crypto::KdfParams {

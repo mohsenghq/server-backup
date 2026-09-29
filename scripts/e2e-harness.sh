@@ -48,6 +48,6 @@ AEGIS_PASSPHRASE=e2e-passphrase cargo run -q -p aegis-cli -- init --repo "$REPO"
 
 # 3. Start the control plane server itself.
 export AEGIS_CATALOG="$CATALOG"
-export AEGIS_LISTEN="127.0.0.1:8080"
+export AEGIS_LISTEN="${AEGIS_LISTEN:-127.0.0.1:8080}"
 export AEGIS_SSH_PASSWORD=test-passphrase
 exec cargo run -q -p aegis-server --bin aegis-server

@@ -103,7 +103,12 @@ fn bench_aead(c: &mut Criterion) {
     let mut group = c.benchmark_group("aead");
     for &size in &[64usize << 10, 1 << 20, 8 << 20] {
         let data = deterministic(size, 13);
-        let sealed = crypto::seal(&key, &nonce, aad, &data).unwrap();
+        // On the wire a sealed blob is `nonce‖ciphertext‖tag` (the `open` side
+        // reads the nonce off the front), so the benchmark has to measure
+        // opening that whole buffer, not the bare ciphertext.
+        let mut sealed = Vec::with_capacity(crypto::NONCE_LEN + size + 16);
+        sealed.extend_from_slice(&nonce);
+        sealed.extend_from_slice(&crypto::seal(&key, &nonce, aad, &data).unwrap());
 
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_function(BenchmarkId::new("seal", size), |b| {

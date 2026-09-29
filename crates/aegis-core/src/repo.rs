@@ -11,7 +11,7 @@ use crate::blobs;
 use crate::chunk::{chunk_stream, ChunkerConfig};
 use crate::crypto::KdfParams;
 use crate::error::{Error, Result};
-use crate::keys::{AeadContext, KeyFile, RepoCrypto};
+use crate::keys::{AeadContext, RepoCrypto};
 use crate::retention::{self, RetentionPolicy};
 use crate::snapshot::{BlobKind, BlobRef, Snapshot, SnapshotIndex, SnapshotStats};
 use crate::tree::{self, Node};
@@ -181,16 +181,6 @@ impl Repository {
         })
     }
 
-    async fn load_key_file(backend: &dyn Backend, slot: &str) -> Result<KeyFile> {
-        let key = format!("{KEYS_PREFIX}/{slot}.json");
-        if !backend.exists(&key).await? {
-            return Err(Error::KeyError(format!(
-                "key slot '{slot}' is missing from the repository"
-            )));
-        }
-        KeyFile::from_json(&backend.get(&key).await?)
-    }
-
     /// Unlock the repository with `passphrase`, trying the configured slot
     /// first and then every other key slot. Passphrases added with `key add`
     /// live in additional slots (`key1`, `key2`, ...), so a repository is
@@ -199,37 +189,14 @@ impl Repository {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::KeyError`] if no key file parses, and
-    /// [`Error::WrongPassphrase`] when the passphrase opens none of them.
+    /// See [`crate::keys::open_any_slot`].
     async fn open_crypto(
         backend: &dyn Backend,
         config: &RepoConfig,
         passphrase: &str,
     ) -> Result<RepoCrypto> {
-        let mut slots = vec![config.key_slot.clone()];
-        for key in backend.list(KEYS_PREFIX).await? {
-            if let Some(stem) = key
-                .strip_prefix("keys/")
-                .and_then(|rest| rest.strip_suffix(".json"))
-            {
-                if !slots.contains(&stem.to_string()) {
-                    slots.push(stem.to_string());
-                }
-            }
-        }
-        let mut last = Error::KeyError("repository has no key files".into());
-        for slot in slots {
-            let Ok(file) = Self::load_key_file(backend, &slot).await else {
-                continue;
-            };
-            match RepoCrypto::from_key_file(&file, passphrase) {
-                Ok(crypto) => return Ok(crypto),
-                // The passphrase may open another slot; remember the failure
-                // in case it opens none.
-                Err(e) => last = e,
-            }
-        }
-        Err(last)
+        let (_slot, crypto) = crate::keys::open_any_slot(backend, config, passphrase).await?;
+        Ok(crypto)
     }
 
     /// Create a repository on the local filesystem — convenience wrapper for
@@ -1333,6 +1300,13 @@ fn file_mode(_meta: &std::fs::Metadata) -> Option<u32> {
 async fn restore_mode(path: &Path, mode: Option<u32>) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     if let Some(mode) = mode {
+        // A mode with no permission bits at all means the source did not report
+        // any (some SFTP servers send only the file-type bits). Restoring that
+        // literally would chmod every file to 000, leaving an unreadable tree —
+        // better to keep the process umask's defaults.
+        if mode & 0o7777 == 0 {
+            return Ok(());
+        }
         tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
             .await
             .map_err(|e| Error::io(path, e))?;

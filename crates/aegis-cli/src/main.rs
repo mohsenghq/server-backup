@@ -111,11 +111,34 @@ enum Command {
 
     /// Add another passphrase that can open this repository. Data is not
     /// re-encrypted: the existing master key is wrapped under the new
-    /// passphrase into a new key slot.
+    /// passphrase into a new key slot. The new passphrase comes from
+    /// `AEGIS_NEW_PASSPHRASE`, or is typed twice when prompted.
     KeyAdd {
         /// Repository to add the key to.
         #[arg(long, value_name = "LOCATION")]
         repo: String,
+    },
+
+    /// List the passphrases (key slots) that can open this repository, and
+    /// which one the repository config names.
+    KeyList {
+        /// Repository to read.
+        #[arg(long, value_name = "LOCATION")]
+        repo: String,
+    },
+
+    /// Revoke a passphrase: delete its key slot so it can no longer unwrap the
+    /// master key. Data is untouched, and the other slots still open the
+    /// repository. The current passphrase is required, and the last remaining
+    /// slot cannot be removed.
+    KeyRemove {
+        /// Repository to revoke the key from.
+        #[arg(long, value_name = "LOCATION")]
+        repo: String,
+
+        /// Key slot to revoke, as shown by `aegis key-list`.
+        #[arg(value_name = "SLOT")]
+        slot: String,
     },
 
     /// Back up one or more paths into a repository as a new snapshot.
@@ -465,6 +488,49 @@ async fn main() -> Result<()> {
                 cli.json,
                 &serde_json::json!({ "repository": repo, "key_slot": r }),
                 || println!("added key slot '{r}' — both passphrases now open this repository"),
+            );
+        }
+
+        Command::KeyList { repo } => {
+            let backend = open_backend(&cli.ssh, &repo)?;
+            let slots = aegis_core::keys::key_list_backend(backend.as_ref())
+                .await
+                .with_context(|| format!("listing key slots in {repo}"))?;
+            emit(cli.json, &slots, || {
+                if slots.is_empty() {
+                    println!("{repo} has no key slots — it may not be a repository");
+                    return;
+                }
+                println!("{:<10}  {:<26}  {:>7}  KDF", "SLOT", "CREATED", "ACTIVE");
+                for s in &slots {
+                    println!(
+                        "{:<10}  {:<26}  {:>7}  {} MiB x {}",
+                        s.slot,
+                        s.created,
+                        if s.active { "yes" } else { "no" },
+                        s.kdf.memory_kib / 1024,
+                        s.kdf.iterations
+                    );
+                }
+            });
+        }
+
+        Command::KeyRemove { repo, slot } => {
+            let existing = load_passphrase(PassphraseSource::default())
+                .context("loading a passphrase that opens the repository")?;
+            let backend = open_backend(&cli.ssh, &repo)?;
+            aegis_core::keys::key_remove_backend(backend.as_ref(), &slot, &existing)
+                .await
+                .with_context(|| format!("revoking key slot '{slot}' from {repo}"))?;
+            emit(
+                cli.json,
+                &serde_json::json!({ "repository": repo, "key_slot": slot, "removed": true }),
+                || {
+                    println!(
+                        "revoked key slot '{slot}' — that passphrase no longer opens {repo}, \
+                     and its data is unchanged"
+                    )
+                },
             );
         }
 

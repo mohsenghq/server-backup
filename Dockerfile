@@ -24,6 +24,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /src
 COPY . .
+# The image already ships a full toolchain; rust-toolchain.toml would make
+# rustup download a second one ("stable") before every cargo invocation.
+RUN rm -f rust-toolchain.toml
 # Cargo's registry/git caches and `target/` are BuildKit caches, so repeat
 # builds only recompile changed crates; the finished binaries are copied into
 # a real layer (/out) because cache-mount writes do not persist in layers.
